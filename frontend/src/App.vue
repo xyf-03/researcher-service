@@ -23,8 +23,8 @@ async function handleLogout(): Promise<void> {
 </script>
 
 <template>
-<div class="app-shell" :class="{ public: $route.name === 'login' }">
-    <nav v-if="$route.name !== 'login'" class="app-nav">
+<div class="app-shell" :class="{ public: $route.meta.public }">
+    <nav v-if="!$route.meta.public" class="app-nav">
       <router-link to="/">容器管理</router-link>
       <router-link to="/chat">对话</router-link>
       <router-link to="/wiki">Wiki</router-link>

@@ -7,6 +7,12 @@ import { useAuthStore } from '@/stores/auth'
 export const routes: RouteRecordRaw[] = [
   { path: '/login', name: 'login', component: () => import('@/views/LoginView.vue'), meta: { public: true } },
   {
+    path: '/legal/:type(terms|privacy)',
+    name: 'legal-document',
+    component: () => import('@/views/LegalDocumentView.vue'),
+    meta: { public: true },
+  },
+  {
     path: '/',
     name: 'containers',
     component: () => import('@/views/ContainersView.vue'),
@@ -70,7 +76,7 @@ router.beforeEach(async (to) => {
   if (to.meta.requiresAuth) {
     await auth.hydrate()
   }
-  if (to.meta.public && auth.isAuthenticated) {
+  if (to.name === 'login' && auth.isAuthenticated) {
     return { name: 'containers' }
   }
   return decideGuard(!!to.meta?.requiresAuth, auth, !!to.meta?.requiresAdmin)

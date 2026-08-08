@@ -104,9 +104,9 @@ async function onChangeSubmit(): Promise<void> {
         <el-button type="primary" native-type="submit" :loading="submitting" :disabled="submitting" @click="onSubmit">登录</el-button>
         <p class="legal-links">
           登录即表示你已阅读并同意
-          <a href="/legal/terms.md" target="_blank" rel="noopener">用户服务协议</a>
+          <router-link to="/legal/terms">用户服务协议</router-link>
           和
-          <a href="/legal/privacy.md" target="_blank" rel="noopener">隐私政策</a>
+          <router-link to="/legal/privacy">隐私政策</router-link>
         </p>
       </el-form>
     </template>
