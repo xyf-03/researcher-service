@@ -8,6 +8,7 @@ import {
   attachmentToMediaBlock,
   extractMessageAttachments,
   extractMessageText,
+  extractThinking,
   type GatewayEventFrame,
   type SessionProjectionReducer,
   type SessionProjectionRun,
@@ -88,7 +89,8 @@ describe('ChatEventTranslator', () => {
     t.translate(chat('delta', 'r1', { deltaText: '你好' }))
     expect(t.translate(chat('final', 'r1', { message: '你好世界' }))).toEqual([
       { type: 'text', runId: 'r1', delta: '世界' },
-      { type: 'done', runId: 'r1' },
+      // #569: done 帧携带归约权威 message（外来局部插入数据通道；本 run 消费端不读）
+      { type: 'done', runId: 'r1', message: '你好世界' },
     ])
   })
 
@@ -98,7 +100,7 @@ describe('ChatEventTranslator', () => {
     t.translate(chat('delta', 'r1', { deltaText: 'Hello  world' }))
     expect(t.translate(chat('final', 'r1', { message: 'Hello world' }))).toEqual([
       { type: 'text', runId: 'r1', delta: 'Hello world', replace: true },
-      { type: 'done', runId: 'r1' },
+      { type: 'done', runId: 'r1', message: 'Hello world' },
     ])
   })
 
@@ -108,7 +110,7 @@ describe('ChatEventTranslator', () => {
     t.translate(chat('delta', 'r1', { deltaText: 'abc' })) // 同内容重复 → sent='abcabc'
     expect(t.translate(chat('final', 'r1', { message: 'abc' }))).toEqual([
       { type: 'text', runId: 'r1', delta: 'abc', replace: true },
-      { type: 'done', runId: 'r1' },
+      { type: 'done', runId: 'r1', message: 'abc' },
     ])
   })
 
@@ -116,47 +118,35 @@ describe('ChatEventTranslator', () => {
   it('final 含 image 块（browser 截图）→ attachment 帧 + done（无文本 tail）', () => {
     const t = makeTranslator()
     t.translate(chat('delta', 'r1', { deltaText: '这是截图' }))
-    expect(
-      t.translate(
-        chat('final', 'r1', {
-          message: { role: 'assistant', content: [{ type: 'text', text: '这是截图' }, { type: 'image', mimeType: 'image/png', content: 'iVBOR' }] },
-        }),
-      ),
-    ).toEqual([
+    const message = {
+      role: 'assistant',
+      content: [{ type: 'text', text: '这是截图' }, { type: 'image', mimeType: 'image/png', content: 'iVBOR' }],
+    }
+    expect(t.translate(chat('final', 'r1', { message }))).toEqual([
       { type: 'attachment', runId: 'r1', media: [{ type: 'image', mimeType: 'image/png', src: 'iVBOR' }] },
-      { type: 'done', runId: 'r1' },
+      { type: 'done', runId: 'r1', message },
     ])
   })
 
   it('final 纯图片（无文本）→ 仅 attachment 帧 + done（纯图片 run 也渲染）', () => {
     const t = makeTranslator()
-    expect(
-      t.translate(
-        chat('final', 'r1', {
-          message: { role: 'assistant', content: [{ type: 'image', mimeType: 'image/png', content: 'AAA' }] },
-        }),
-      ),
-    ).toEqual([
+    const message = { role: 'assistant', content: [{ type: 'image', mimeType: 'image/png', content: 'AAA' }] }
+    expect(t.translate(chat('final', 'r1', { message }))).toEqual([
       { type: 'attachment', runId: 'r1', media: [{ type: 'image', mimeType: 'image/png', src: 'AAA' }] },
-      { type: 'done', runId: 'r1' },
+      { type: 'done', runId: 'r1', message },
     ])
   })
 
   it('final 含 audio + video 块 → attachment 帧携两媒体 + done', () => {
     const t = makeTranslator()
-    expect(
-      t.translate(
-        chat('final', 'r1', {
-          message: {
-            role: 'assistant',
-            content: [
-              { type: 'audio', mimeType: 'audio/mpeg', content: 'QUJD' },
-              { type: 'video', mimeType: 'video/mp4', content: 'REVG' },
-            ],
-          },
-        }),
-      ),
-    ).toEqual([
+    const message = {
+      role: 'assistant',
+      content: [
+        { type: 'audio', mimeType: 'audio/mpeg', content: 'QUJD' },
+        { type: 'video', mimeType: 'video/mp4', content: 'REVG' },
+      ],
+    }
+    expect(t.translate(chat('final', 'r1', { message }))).toEqual([
       {
         type: 'attachment',
         runId: 'r1',
@@ -165,16 +155,148 @@ describe('ChatEventTranslator', () => {
           { type: 'video', mimeType: 'video/mp4', src: 'REVG' },
         ],
       },
-      { type: 'done', runId: 'r1' },
+      { type: 'done', runId: 'r1', message },
     ])
   })
 
   it('final 纯文本（无媒体块）→ 不产 attachment 帧（回归无差）', () => {
     const t = makeTranslator()
     t.translate(chat('delta', 'r1', { deltaText: '你好' }))
-    expect(t.translate(chat('final', 'r1', { message: { role: 'assistant', content: [{ type: 'text', text: '你好' }] } }))).toEqual([
-      { type: 'done', runId: 'r1' },
+    const message = { role: 'assistant', content: [{ type: 'text', text: '你好' }] }
+    expect(t.translate(chat('final', 'r1', { message }))).toEqual([{ type: 'done', runId: 'r1', message }])
+  })
+
+  // ---- #565: 结构化 thinking 块随 text 帧携带（方案 A：翻译层提取、随帧携带）----
+  // 结构化块只在 replace 快照 / final 消息的 content[] 出现（delta 增量字段是纯文本串，无 content[]），
+  // 故增量帧恒不挂 thinking（undefined），handleText 对 undefined 走内联路（splitThinking）现状。
+  it('#565: delta replace 快照含 thinking 块 → replace 帧带 thinking', () => {
+    const t = makeTranslator()
+    expect(
+      t.translate(
+        chat('delta', 'r1', {
+          replace: true,
+          message: { role: 'assistant', content: [{ type: 'thinking', thinking: '推理' }, { type: 'text', text: '快照正文' }] },
+        }),
+      ),
+    ).toEqual([
+      { type: 'text', runId: 'r1', delta: '快照正文', replace: true, thinking: '推理' },
     ])
+  })
+
+  it('#565: delta replace 快照无 thinking 块 → replace 帧不带 thinking（回归无差）', () => {
+    const t = makeTranslator()
+    expect(t.translate(chat('delta', 'r1', { message: 'The dog', replace: true }))).toEqual([
+      { type: 'text', runId: 'r1', delta: 'The dog', replace: true },
+    ])
+  })
+
+  // thinking-only replace 快照（思考先于正文的模型输出，text 块未出现）：无文本可渲染——发
+  // delta='' 增量帧携带思考（delta='' 不改变前端 raw 累积，仅覆盖 thinking；sent 不更新）
+  it('#565: delta replace 快照 thinking-only（无 text 块）→ delta=\'\' 帧带 thinking', () => {
+    const t = makeTranslator()
+    expect(
+      t.translate(
+        chat('delta', 'r1', {
+          replace: true,
+          message: { role: 'assistant', content: [{ type: 'thinking', thinking: '先想后答' }] },
+        }),
+      ),
+    ).toEqual([{ type: 'text', runId: 'r1', delta: '', thinking: '先想后答' }])
+  })
+
+  it('#565: final 含 thinking 块（尾部补发）→ tail 帧带 thinking + done', () => {
+    const t = makeTranslator()
+    t.translate(chat('delta', 'r1', { deltaText: '正文' }))
+    const message = { role: 'assistant', content: [{ type: 'thinking', thinking: '最终推理' }, { type: 'text', text: '正文尾部' }] }
+    expect(t.translate(chat('final', 'r1', { message }))).toEqual([
+      { type: 'text', runId: 'r1', delta: '尾部', thinking: '最终推理' },
+      { type: 'done', runId: 'r1', message },
+    ])
+  })
+
+  it('#565: final 非前缀（F9 replace 纠正）含 thinking → replace 帧带 thinking', () => {
+    const t = makeTranslator()
+    t.translate(chat('delta', 'r1', { deltaText: '旧' }))
+    const message = { role: 'assistant', content: [{ type: 'thinking', thinking: '推理' }, { type: 'text', text: '新正文' }] }
+    expect(t.translate(chat('final', 'r1', { message }))).toEqual([
+      { type: 'text', runId: 'r1', delta: '新正文', replace: true, thinking: '推理' },
+      { type: 'done', runId: 'r1', message },
+    ])
+  })
+
+  // final 权威文本与 sent 相等（流式 deltaText 已发完，F9 无漂移）→ 不产 text 帧（tail/replace
+  // 无变化）；但思考常在 final 的 content[] 才出现（delta 增量是纯文本串）——结构化 thinking 经
+  // done 帧独立通道携带（消费端 handleDone 在 finalizeLast 前写入；不谎报文本变更的 replace 帧）
+  it('#565: final 含 thinking 块且文本与 sent 相等 → done 帧带 thinking', () => {
+    const t = makeTranslator()
+    t.translate(chat('delta', 'r1', { deltaText: 'ok' }))
+    const message = { role: 'assistant', content: [{ type: 'thinking', thinking: '思考' }, { type: 'text', text: 'ok' }] }
+    expect(t.translate(chat('final', 'r1', { message }))).toEqual([
+      { type: 'done', runId: 'r1', thinking: '思考', message },
+    ])
+  })
+
+  it('#565: final 无文本（thinking-only 消息，E1b abort 形状）→ done 帧带 thinking', () => {
+    const t = makeTranslator()
+    const message = { role: 'assistant', content: [{ type: 'thinking', thinking: '推理' }, { type: 'toolCall', name: 'exec' }] }
+    expect(t.translate(chat('final', 'r1', { message }))).toEqual([
+      { type: 'done', runId: 'r1', thinking: '推理', message },
+    ])
+  })
+
+  // final 已产 tail 帧（已带 thinking）→ done 不重复挂（幂等，文本变化仍走 text 帧）
+  it('#565: final 相等含 thinking 但已产 text 帧 → done 帧不带 thinking（不重复）', () => {
+    const t = makeTranslator()
+    t.translate(chat('delta', 'r1', { deltaText: '正文' }))
+    const message = { role: 'assistant', content: [{ type: 'thinking', thinking: '最终推理' }, { type: 'text', text: '正文尾部' }] }
+    expect(t.translate(chat('final', 'r1', { message }))).toEqual([
+      { type: 'text', runId: 'r1', delta: '尾部', thinking: '最终推理' },
+      { type: 'done', runId: 'r1', message },
+    ])
+  })
+
+  // F9 现有相等回归：message 为 string 时无结构化块 → 仍只发 done（不挂 thinking 字段，行为不变）
+  it('#565: final 与 sent 相等且无 thinking 块 → 仅 done（回归无差）', () => {
+    const t = makeTranslator()
+    t.translate(chat('delta', 'r1', { deltaText: 'ok' }))
+    expect(t.translate(chat('final', 'r1', { message: 'ok' }))).toEqual([
+      { type: 'done', runId: 'r1', message: 'ok' },
+    ])
+  })
+
+  it('#565: final 无 thinking 块（tail 补发）→ tail 帧不带 thinking（回归无差）', () => {
+    const t = makeTranslator()
+    t.translate(chat('delta', 'r1', { deltaText: '你好' }))
+    expect(t.translate(chat('final', 'r1', { message: '你好世界' }))).toEqual([
+      { type: 'text', runId: 'r1', delta: '世界' },
+      { type: 'done', runId: 'r1', message: '你好世界' },
+    ])
+  })
+
+  // #569: done 帧扩展——外来 run final 的归约权威 message（currentRun.message）透出到 done 帧，
+  // 供 handleDone 外来分支局部插入（数据通道）。翻译层无外来概念（纯函数），有归约 message 即带；
+  // 消费端只在外来分支读该字段，本 run 分支沿用 tail 补发逻辑不读。
+  it('#569: final 归约 message 透出到 done 帧（外来可见 final 局部插入的数据通道）', () => {
+    const t = makeTranslator()
+    const message = { role: 'assistant', content: [{ type: 'text', text: '外来结果' }] }
+    expect(t.translate(chat('final', 'foreign-1', { message }))).toEqual([
+      { type: 'text', runId: 'foreign-1', delta: '外来结果' },
+      { type: 'done', runId: 'foreign-1', message },
+    ])
+  })
+
+  // #569: 归约无 message（final 未带权威 message 且无 delta 快照）→ done 帧不带 message 字段
+  //（外来分支无可插入内容，行为同现状）。
+  it('#569: final 归约无 message → done 帧不带 message（外来分支无可插入，回归无差）', () => {
+    const t = makeTranslator()
+    expect(t.translate(chat('final', 'foreign-1'))).toEqual([{ type: 'done', runId: 'foreign-1' }])
+  })
+
+  it('#565: delta 增量帧不挂 thinking（undefined）', () => {
+    const t = makeTranslator()
+    const [frame] = t.translate(chat('delta', 'r1', { deltaText: 'x' }))
+    expect(frame).toEqual({ type: 'text', runId: 'r1', delta: 'x' })
+    expect('thinking' in frame).toBe(false)
   })
 
   it('delta replace 快照含媒体无文本 → attachment 帧（不回退 deltaText）', () => {
@@ -195,7 +317,7 @@ describe('ChatEventTranslator', () => {
     const t = makeTranslator()
     t.translate(chat('delta', 'r1', { deltaText: 'ok' }))
     expect(t.translate(chat('final', 'r1', { message: 'ok' }))).toEqual([
-      { type: 'done', runId: 'r1' },
+      { type: 'done', runId: 'r1', message: 'ok' },
     ])
   })
 
@@ -205,7 +327,7 @@ describe('ChatEventTranslator', () => {
     const msg = { role: 'assistant', content: [{ type: 'text', text: '你好世界' }], timestamp: 1785148522491 }
     expect(t.translate(chat('final', 'r1', { message: msg }))).toEqual([
       { type: 'text', runId: 'r1', delta: '世界' },
-      { type: 'done', runId: 'r1' },
+      { type: 'done', runId: 'r1', message: msg },
     ])
   })
 
@@ -387,7 +509,8 @@ describe('ChatEventTranslator', () => {
     proj.results.set('r1', { run: { runId: 'r1', status: 'completed', message: 'Hello world' } })
     expect(t.translate(chat('final', 'r1', { message: 'stale' }))).toEqual([
       { type: 'text', runId: 'r1', delta: ' world' },
-      { type: 'done', runId: 'r1' },
+      // #569: done 帧携带归约权威 message（currentRun.message，非 payload）
+      { type: 'done', runId: 'r1', message: 'Hello world' },
     ])
   })
 
@@ -468,7 +591,7 @@ describe('ChatEventTranslator', () => {
     const out = t.translate({ type: 'event', event: 'chat', payload: { runId: 'r1', state: 'final', message: 'abc def' } })
     expect(out).toEqual([
       { type: 'text', runId: 'r1', delta: 'abc def' }, // 完整文本（非 ' def' 尾部残差）
-      { type: 'done', runId: 'r1' },
+      { type: 'done', runId: 'r1', message: 'abc def' },
     ])
   })
 
@@ -509,6 +632,49 @@ describe('extractMessageText（E1: content 多态，ChatView 历史复用）', (
     expect(extractMessageText(null)).toBe('')
     expect(extractMessageText({ role: 'assistant' })).toBe('')
     expect(extractMessageText({})).toBe('')
+  })
+})
+
+// #565: extractThinking —— 结构化 thinking 块提取单一实现（history 全量 + 流式 replace/final 复用，
+// 与 extractMessageText 并列：只读 content[] 中 type==='thinking' 块的 thinking 字段（非 text）、
+// 逐块 trim、丢空串、多块 '\n' join、全空/无块/content 非数组/message 非对象 → null（区别于 ''））。
+// 与内联 <thinking> 标签路（splitThinking）双路并存、各司其职（对齐官方 stripThinkingTags +
+// extractThinking 双函数分工）。
+describe('extractThinking（#565: 结构化 thinking 块提取）', () => {
+  it('trim + 多块 \n join（跳过 text 块，不读 text 字段兜底）', () => {
+    expect(
+      extractThinking({
+        role: 'assistant',
+        content: [
+          { type: 'thinking', thinking: '  想A  ' },
+          { type: 'text', text: '正文' },
+          { type: 'thinking', thinking: '想B' },
+        ],
+      }),
+    ).toBe('想A\n想B')
+  })
+  it('全空/无 thinking 块/content 非数组/message 为 string 或 null → null', () => {
+    expect(extractThinking({ role: 'assistant', content: [{ type: 'thinking', thinking: '   ' }] })).toBeNull()
+    expect(extractThinking({ role: 'assistant', content: [{ type: 'thinking', thinking: '' }] })).toBeNull()
+    expect(extractThinking({ role: 'assistant', content: [{ type: 'text', text: 'x' }] })).toBeNull()
+    expect(extractThinking({ role: 'assistant' })).toBeNull()
+    expect(extractThinking({ role: 'user', content: '字符串' })).toBeNull()
+    expect(extractThinking('字符串')).toBeNull()
+    expect(extractThinking(null)).toBeNull()
+  })
+  it('thinking 字段非 string（缺省/null/数字）→ 跳过该块；混入有效块时跳过不拦截', () => {
+    expect(
+      extractThinking({
+        role: 'assistant',
+        content: [{ type: 'thinking' }, { type: 'thinking', thinking: null }, { type: 'thinking', thinking: 42 }],
+      }),
+    ).toBeNull()
+    expect(
+      extractThinking({
+        role: 'assistant',
+        content: [{ type: 'thinking', thinking: null }, { type: 'thinking', thinking: '有效' }],
+      }),
+    ).toBe('有效')
   })
 })
 
@@ -592,6 +758,107 @@ describe('extractMessageAttachments（#459-T3 #464: image/audio/video 块 → �
       }),
     ).toEqual([{ type: 'image', mimeType: 'image/*', src: 'AAA' }])
   })
+
+  // ---- #568: history 附件元数据增强——同形状条件透传（有才带上、缺则不带，0 信任）----
+  it('#568: 块带 sizeBytes/durationMs/width/height/label → 条件透传进 MediaBlock', () => {
+    expect(
+      extractMessageAttachments({
+        role: 'assistant',
+        content: [{
+          type: 'image', mimeType: 'image/png', content: 'AAA',
+          sizeBytes: 1024, durationMs: 500, width: 1280, height: 720, label: '截图',
+        }],
+      }),
+    ).toEqual([{
+      type: 'image', mimeType: 'image/png', src: 'AAA',
+      sizeBytes: 1024, durationMs: 500, width: 1280, height: 720, label: '截图',
+    }])
+  })
+  it('#568: 非法元数据值（负数/非 number/空 label）→ 条件透传不带（回退现状形状）', () => {
+    expect(
+      extractMessageAttachments({
+        role: 'assistant',
+        content: [{
+          type: 'video', mimeType: 'video/mp4', content: 'REVG',
+          sizeBytes: -1, durationMs: '500', width: 0, height: -720, label: '',
+        }],
+      }),
+    ).toEqual([{ type: 'video', mimeType: 'video/mp4', src: 'REVG' }])
+  })
+  // ---- #568: document 型 + attachment/url 形态（纯防御：面板 history 未实测，条件透传保证无形态则零影响）----
+  it('#568: document 型块（content base64）→ type document + fileName/sizeBytes', () => {
+    expect(
+      extractMessageAttachments({
+        role: 'assistant',
+        content: [{ type: 'document', mimeType: 'application/pdf', fileName: 'report.pdf', content: 'JVBER', sizeBytes: 2048 }],
+      }),
+    ).toEqual([{ type: 'document', mimeType: 'application/pdf', fileName: 'report.pdf', src: 'JVBER', sizeBytes: 2048 }])
+  })
+  it('#568: attachment 形态块（{type:attachment, attachment:{kind,url,...}}）→ 从子对象提取', () => {
+    expect(
+      extractMessageAttachments({
+        role: 'assistant',
+        content: [{
+          type: 'attachment',
+          attachment: { kind: 'image', url: 'https://img.example.com/x.png', mimeType: 'image/png', label: '外链图', sizeBytes: 512, width: 640, height: 480 },
+        }],
+      }),
+    ).toEqual([{
+      type: 'image', mimeType: 'image/png', src: 'https://img.example.com/x.png',
+      label: '外链图', sizeBytes: 512, width: 640, height: 480,
+    }])
+  })
+  it('#568: url 形态块（{type:document, url,...}）→ src 直存完整 url 不拼 base64', () => {
+    expect(
+      extractMessageAttachments({
+        role: 'assistant',
+        content: [{ type: 'document', url: 'https://files.example.com/report.pdf', label: '报告', sizeBytes: 4096 }],
+      }),
+    ).toEqual([{ type: 'document', mimeType: 'document/*', src: 'https://files.example.com/report.pdf', label: '报告', sizeBytes: 4096 }])
+  })
+  it('#568: attachment 形态缺 kind / url 形态缺 url → 跳过该块（0 信任）', () => {
+    expect(
+      extractMessageAttachments({
+        role: 'assistant',
+        content: [
+          { type: 'attachment', attachment: { url: 'https://x/y.png' } }, // 无 kind
+          { type: 'attachment' }, // 无 attachment 子对象
+          { type: 'document', label: '无 url' }, // url 形态无 url
+        ],
+      }),
+    ).toEqual([])
+  })
+  // ---- #568 安全修复（security review）：url 形态只收完整 http(s)——其他 scheme/相对/畸形 url 一律跳过 ----
+  it('#568(security): url 形态非 http(s)（javascript:/file:/data:/相对 url）→ 跳过该块', () => {
+    expect(
+      extractMessageAttachments({
+        role: 'assistant',
+        content: [
+          { type: 'image', url: 'javascript:alert(1)' },
+          { type: 'document', url: 'file:///etc/passwd' },
+          { type: 'audio', url: 'data:audio/mpeg;base64,QUJD' },
+          { type: 'video', url: '//evil.com/x.mp4' }, // 协议相对
+          { type: 'image', url: '/relative.png' }, // 相对路径
+        ],
+      }),
+    ).toEqual([])
+  })
+  it('#568(security): attachment 形态 url 非 http(s) → 跳过该块', () => {
+    expect(
+      extractMessageAttachments({
+        role: 'assistant',
+        content: [{ type: 'attachment', attachment: { kind: 'image', url: 'javascript:alert(1)' } }],
+      }),
+    ).toEqual([])
+  })
+  it('#568(security): attachment 形态 url 为完整 http(s)（含 mimeType 缺失回退）→ 保留', () => {
+    expect(
+      extractMessageAttachments({
+        role: 'assistant',
+        content: [{ type: 'attachment', attachment: { kind: 'image', url: 'http://img.example.com/x.png' } }],
+      }),
+    ).toEqual([{ type: 'image', mimeType: 'image/*', src: 'http://img.example.com/x.png' }])
+  })
 })
 
 // #459-T3 #464：attachmentToMediaBlock——发送 echo 路径（useChatConnection.send）与历史/流式
@@ -622,6 +889,26 @@ describe('attachmentToMediaBlock（#459-T3 #464: 发送侧 Attachment → MediaB
   it('mimeType 缺失 → 回退 type/ 前缀', () => {
     expect(attachmentToMediaBlock({ type: 'image', content: 'AAA' })).toEqual({
       type: 'image', mimeType: 'image/*', src: 'AAA',
+    })
+  })
+  // ---- #568: 发送 echo 路接通——Attachment 带 4 元数据 → 透传进 MediaBlock（§2.1 数据已确证）----
+  it('#568: Attachment 带 sizeBytes/durationMs/width/height → 条件透传', () => {
+    expect(
+      attachmentToMediaBlock({ type: 'image', mimeType: 'image/png', fileName: 'shot.png', content: 'iVBOR', sizeBytes: 1024, width: 640, height: 480 }),
+    ).toEqual({
+      type: 'image', mimeType: 'image/png', src: 'iVBOR', fileName: 'shot.png', sizeBytes: 1024, width: 640, height: 480,
+    })
+  })
+  it('#568: Attachment 非法元数据值（负数）→ 不带（回退现状形状）', () => {
+    expect(
+      attachmentToMediaBlock({ type: 'image', mimeType: 'image/png', content: 'iVBOR', sizeBytes: -5, width: 0 }),
+    ).toEqual({ type: 'image', mimeType: 'image/png', src: 'iVBOR' })
+  })
+  it('#568: document 附件 → document MediaBlock（发送 echo 路防御）', () => {
+    expect(
+      attachmentToMediaBlock({ type: 'document', mimeType: 'application/pdf', fileName: 'doc.pdf', content: 'JVBER', sizeBytes: 2048 }),
+    ).toEqual({
+      type: 'document', mimeType: 'application/pdf', fileName: 'doc.pdf', src: 'JVBER', sizeBytes: 2048,
     })
   })
 })

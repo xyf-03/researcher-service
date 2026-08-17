@@ -1,0 +1,6 @@
+# 本地 venv / 缓存 / 测试产物（镜像构建不含这些）
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.png.tmp

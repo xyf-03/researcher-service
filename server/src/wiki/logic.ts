@@ -154,3 +154,24 @@ export function frontmatterTitle(frontmatter: Frontmatter): string | undefined {
   }
   return undefined
 }
+
+// UTF-8 严格解码：非法字节抛 TypeError（对齐 Python read_text(encoding='utf-8') 的
+// UnicodeDecodeError；Node 默认 toString('utf8') 用 U+FFFD 静默替换，会破坏降级语义）。
+// ignoreBOM:true 保留 U+FEFF（Python read_text 逐字节保留 BOM；默认 false 会吞掉——GET 不再原文
+// 返回、round-trip 丢 BOM、解析层把 BOM 前缀页误识别成 frontmatter。codex PR#346）。
+// （自 nodeFs.ts 搬入：Node 适配器退役后由 Docker 适配器复用。）
+export function decodeUtf8Strict(buf: Buffer): string {
+  return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(buf)
+}
+
+// 正文首个 `# ` 标题文本（无 frontmatter 时的标题兜底，categories 聚合用）；无 H1 返回 null。
+// （自 nodeFs.ts 搬入，同上。）
+export function h1Title(body: string): string | null {
+  for (const line of body.split('\n')) {
+    if (line.startsWith('# ')) {
+      const t = line.slice(2).trim()
+      return t || null
+    }
+  }
+  return null
+}

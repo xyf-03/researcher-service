@@ -13,6 +13,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { listInstances } from '@/api/containers'
 import { ApiError } from '@/api/client'
 import { useChatStore } from '@/stores/chat'
+import { useFileTabsStore } from '@/stores/fileTabs'
 import { useAuthStore } from '@/stores/auth'
 import { useChatConnection } from '@/chat/useChatConnection'
 import {
@@ -28,12 +29,32 @@ import ChatHeader from '@/components/chat/ChatHeader.vue'
 import ChatStream from '@/components/chat/ChatStream.vue'
 import ChatComposer from '@/components/chat/ChatComposer.vue'
 import ApprovalDock from '@/components/chat/ApprovalDock.vue'
+import FileTabsPanel from '@/components/chat/FileTabsPanel.vue'
 
 const chat = useChatStore()
 const auth = useAuthStore()
 // 视图专属态（connecting/errorMsg 上抛至此，disconnected 在 composable 内）
 const connecting = ref(false)
 const errorMsg = ref('')
+
+// #626 T1：左栏「会话｜文件」分段态（视图专属，默认「会话」）+ workspace 文件 tab store（决议 A：与 chatStore 同级）
+const sidebarTab = ref<'sessions' | 'files'>('sessions')
+const fileTabs = useFileTabsStore()
+// 切到「文件」分段：树未加载则拉一次（同容器切回不重拉）；切容器：reset 已清树，在 files 分段时重拉
+watch(sidebarTab, (tab) => {
+  if (tab === 'files' && chat.selectedContainer && !fileTabs.tree && !fileTabs.treeLoading) {
+    void fileTabs.loadTree()
+  }
+})
+watch(() => chat.selectedContainer, (name) => {
+  if (sidebarTab.value === 'files' && name) void fileTabs.loadTree()
+})
+function switchSidebarTab(tab: 'sessions' | 'files'): void {
+  sidebarTab.value = tab
+}
+function activateTab(path: string): void {
+  fileTabs.activePath = path
+}
 
 const conn = useChatConnection({
   onConnecting(v: boolean) {
@@ -78,11 +99,10 @@ const connectionState = computed(() => {
   return null
 })
 
-// #542：执行状态指示——连接生命周期 × 审批/工具/流式活动的单行汇总（与上方连接横幅互补，
-// 横幅只报连接态，此行额外反映「正在干活」的瞬时态）
+// #542：执行状态指示——与上方连接横幅互补，横幅只报连接态（正在连接/断开/加载失败），
+// 此行只反映「正在干活」的瞬时态；横幅可见时返回空串整行隐藏，不重复横幅文案。
 const executionStatus = computed(() => {
-  if (conn.disconnected.value) return '连接已断开'
-  if (connecting.value) return '正在连接…'
+  if (connectionState.value) return ''
   if (visibleApprovals.value.some((a) => a.status === 'pending')) return '等待批准'
   if (chat.messages.some((m) => m.tools.some((t) => t.state === 'running'))) return '正在执行工具…'
   if (streaming.value) return '模型正在回答…'
@@ -112,15 +132,11 @@ watch(() => chat.input, (value) => {
   const storage = draftStorage(); if (!storage) return
   if (value) storage.setItem(draftKey(), value); else storage.removeItem(draftKey())
 })
-// #547：pending/resolving 请求固定在 composer 上方，避免被长回答顶出可视区域；已处理或失效卡
-// 回到原消息时间线留存操作记录。只改变渲染位置，不改变审批状态机与可见性过滤语义。
+// #547 / ADR 0014：pending/resolving 请求固定在 composer 上方 ApprovalDock，避免被长回答顶出可视区域。
+// resolved/expired 卡不留痕（ADR 0014 supersede #547 的留痕意图）——落定即从界面消失，不回时间线。
 const activeApprovals = computed(() =>
   visibleApprovals.value.filter((a) => a.status === 'pending' || a.status === 'resolving'),
 )
-const historicalApprovals = computed(() =>
-  visibleApprovals.value.filter((a) => a.status === 'resolved' || a.status === 'expired'),
-)
-const anchorState = computed(() => historicalApprovals.value.length > 0)
 
 // 删除会话：确认（ElMessageBox）由本壳注入（composable 内不持有 UI）。
 // #461：文案明示硬删除不可恢复（删除即硬删，无「归档/可恢复」中间态，与真实网关语义一致）。
@@ -239,10 +255,16 @@ defineExpose({
       :sessions="chat.sessions"
       :selected-container="chat.selectedContainer"
       :selected-session="chat.selectedSession"
+      :sidebar-tab="sidebarTab"
+      :tree="fileTabs.tree"
+      :tree-error="fileTabs.treeError"
+      :active-file-path="fileTabs.activePath ?? ''"
       @select-container="conn.selectContainer"
       @select-session="conn.pickSession"
       @remove-session="removeSession"
       @new-session="conn.newSession"
+      @switch-tab="switchSidebarTab"
+      @open-file="(path: string) => void fileTabs.openFromTree(path)"
     />
     <main class="main">
       <ChatHeader
@@ -255,17 +277,12 @@ defineExpose({
         <span v-if="connectionState.detail" class="connection-detail" data-test="error-bar">{{ connectionState.detail }}</span>
         <button v-if="conn.disconnected.value" class="reconnect" data-test="reconnect" @click="conn.connect()">重新连接</button>
       </div>
-      <div class="execution-status" role="status" aria-live="polite" data-test="execution-status">{{ executionStatus }}</div>
+      <div v-if="executionStatus" class="execution-status" role="status" aria-live="polite" data-test="execution-status">{{ executionStatus }}</div>
       <ChatStream
         :messages="chat.messages"
-        :approvals="historicalApprovals"
-        :anchor-state="anchorState"
-        :disconnected="conn.disconnected.value"
         :history-has-more="chat.historyHasMore"
         :history-loading="chat.historyLoading"
         @load-more="conn.loadMoreHistory"
-        @resolve-approval="conn.resolveApproval"
-        @toggle-approval-detail="toggleApprovalDetail"
         @regenerate="regenerate"
       >
         <!-- #461：无选中会话（含删除当前会话后）→ 空态视图 + 「新建会话」入口 -->
@@ -322,12 +339,23 @@ defineExpose({
         </template>
       </ChatComposer>
     </main>
+    <FileTabsPanel
+      v-if="fileTabs.tabs.length"
+      class="file-panel"
+      :tabs="fileTabs.tabs"
+      :active-path="fileTabs.activePath"
+      @activate="activateTab"
+      @close="fileTabs.closeTab"
+      @close-all="fileTabs.closeAll"
+      @retry="fileTabs.retry"
+    />
   </div>
 </template>
 
 <style scoped>
 .chat { display: flex; height: 100%; min-height: 0; }
 .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.file-panel { width: 360px; flex: none; }
 .connection-banner { display: flex; align-items: center; gap: 10px; padding: 8px 18px; font-size: 13px; }
 .connection-banner.info { color: var(--el-color-primary); background: var(--el-color-primary-light-9); }
 .connection-banner.danger { color: var(--el-color-danger); background: var(--el-color-danger-light-9); }

@@ -34,7 +34,9 @@ jobs:
       run:
         working-directory: server
     env:
-      # 与 test/containers-smoke 默认同源（smoke 读 process.env.OPENCLAW_IMAGE ?? 默认 tag）。
+      # 显式 pin 官方基线跑 smoke（派生镜像 ghcr.io/.../openclaw 由 CD 在 CI 通过后构建推送，
+      # CI 阶段尚不存在；smoke 测编排逻辑，官方/派生镜像等价）。派生镜像的静态断言
+      # 在 test/openclawImage.test.ts（本 job 全量跑）。
       # CI runner 自带 docker daemon → smoke 门控放行真跑（区别于本地无 daemon 时 skip），
       # 故须预拉镜像，否则 create 拉镜像 404 让 smoke 红（镜像缺失是环境问题，非代码问题）。
       OPENCLAW_IMAGE: ghcr.io/openclaw/openclaw:2026.7.1-browser
@@ -50,6 +52,11 @@ jobs:
       - run: npm run typecheck
       # 预拉 OpenClaw 公共 ghcr 镜像供 containers-smoke 端到端测试。
       - run: docker pull ${{ env.OPENCLAW_IMAGE }}
+      # 派生镜像构建验证（issue #588）：Dockerfile 构建期断言（pdftotext 可用 + 12 骨架文件
+      # 齐全）在此实跑——构建失败 CI 即红，派生镜像的首次执行不落在生产（CD 另负责推送）。
+      - name: Build derived openclaw image (issue #588)
+        # working-directory=server → 上下文经 ../deploy 回仓库根
+        run: docker build ../deploy/openclaw-image
       # 端口映射探针（#378 CI 定位）：确认 runner 上容器宿主端口映射可用（docker-proxy）。
       # 容器内须有真实监听服务（busybox httpd）才可信——之前用 sh /dev/tcp 自连是误报。
       - name: Docker port mapping probe

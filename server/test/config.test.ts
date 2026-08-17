@@ -494,3 +494,289 @@ describe('panel public origin env (slice config, #385)', () => {
     )
   })
 })
+
+// #590/#592：OPENCLAW_NAMED_VOLUMES —— named volume 拓扑编排开关（ADR 0011）。默认 true =
+// named volume 拓扑（#592 本地/CI 编排默认：三卷 + putArchive config）；显式 false 回退旧宿主
+// bind。非 true/false 值 fail-fast（对齐 readHealthScheme 白名单模式）——否则 `TRUE`/`1` 这类
+// 错值静默按默认 true 走，flag 关了却没生效。
+describe('named volumes flag (slice config, #590/#592)', () => {
+  async function loadNamedVolumes(env: string | undefined): Promise<boolean | 'THREW'> {
+    vi.resetModules() // 清 config 模块缓存，让动态 import 重新快照 env
+    if (env === undefined) delete process.env.OPENCLAW_NAMED_VOLUMES
+    else vi.stubEnv('OPENCLAW_NAMED_VOLUMES', env)
+    try {
+      const { config } = await import('../src/config')
+      return config.fleet.namedVolumes
+    } catch {
+      return 'THREW' // fail-fast
+    } finally {
+      vi.unstubAllEnvs() // 恢复 env（避免污染后续测试文件）
+    }
+  }
+
+  it('未设置 → 默认 true（named volume 拓扑，#592 本地/CI 默认）', async () => {
+    expect(await loadNamedVolumes(undefined)).toBe(true)
+  })
+
+  it('显式 true → 开启 named volume 拓扑', async () => {
+    expect(await loadNamedVolumes('true')).toBe(true)
+  })
+
+  it('显式 false → 保持旧 bind', async () => {
+    expect(await loadNamedVolumes('false')).toBe(false)
+  })
+
+  it('非法 TRUE（大小写敏感）→ fail-fast（防错值静默按默认走）', async () => {
+    expect(await loadNamedVolumes('TRUE')).toBe('THREW')
+  })
+
+  it('非法 1 → fail-fast', async () => {
+    expect(await loadNamedVolumes('1')).toBe('THREW')
+  })
+
+  it('非法 yes → fail-fast', async () => {
+    expect(await loadNamedVolumes('yes')).toBe('THREW')
+  })
+})
+
+// T01（docs/autofigure/tickets/T01-authenticated-figure-creation.md）：AUTOFIGURE_ENABLED ——
+// AutoFigure 域开关（默认关 = figures 路由未装配 → /api/v1/figures 90005）。非 true/false 值
+// fail-fast（对齐 readNamedVolumes 白名单模式）——否则 `1`/`TRUE` 这类错值静默按默认 false 走，
+// flag 开了却没生效（错误方向是「路由缺席」，fail-fast 更安全）。
+describe('AutoFigure enabled flag (slice config, T01)', () => {
+  async function loadAutofigureEnabled(env: string | undefined): Promise<boolean | 'THREW'> {
+    vi.resetModules() // 清 config 模块缓存，让动态 import 重新快照 env
+    if (env === undefined) delete process.env.AUTOFIGURE_ENABLED
+    else vi.stubEnv('AUTOFIGURE_ENABLED', env)
+    try {
+      const { config } = await import('../src/config')
+      return config.autofigure.enabled
+    } catch {
+      return 'THREW' // fail-fast
+    } finally {
+      vi.unstubAllEnvs() // 恢复 env（避免污染后续测试文件）
+    }
+  }
+
+  it('未设置 → 默认 false（flag 关 = 路由未装配）', async () => {
+    expect(await loadAutofigureEnabled(undefined)).toBe(false)
+  })
+
+  it('显式 true → 装配 /api/v1/figures', async () => {
+    expect(await loadAutofigureEnabled('true')).toBe(true)
+  })
+
+  it('显式 false → 保持关闭', async () => {
+    expect(await loadAutofigureEnabled('false')).toBe(false)
+  })
+
+  it('非法 1 → fail-fast（防错值静默按默认 false 走）', async () => {
+    expect(await loadAutofigureEnabled('1')).toBe('THREW')
+  })
+
+  it('非法 TRUE（大小写敏感）→ fail-fast', async () => {
+    expect(await loadAutofigureEnabled('TRUE')).toBe('THREW')
+  })
+
+  it('非法 yes → fail-fast', async () => {
+    expect(await loadAutofigureEnabled('yes')).toBe('THREW')
+  })
+})
+
+// T03（docs/autofigure/tickets/T03-single-worker-generation-lifecycle.md）：AUTOFIGURE_LLM_KEY ——
+// AutoFigure 生成凭证（服务端执行上下文）。flag 开 + 生产缺 key → fail-fast（否则 queued Job 永不
+// 被跑、错配只在请求期暴露）；dev/test 缺省容忍空串（runner 纯逻辑测试经 DI 注入，不经 config）。
+// 超时值管道属 T04，本 describe 不测任何 timeout 配置。
+describe('AutoFigure llm key env (slice config, T03)', () => {
+  async function loadAutofigureLlmKey(opts: {
+    env?: string
+    flag?: string | undefined
+    key?: string | undefined
+  }): Promise<string | 'THREW'> {
+    vi.resetModules() // 清 config 模块缓存，让动态 import 重新快照 env
+    const { env = 'development', flag, key } = opts
+    vi.stubEnv('NODE_ENV', env)
+    if (flag === undefined) delete process.env.AUTOFIGURE_ENABLED
+    else vi.stubEnv('AUTOFIGURE_ENABLED', flag)
+    if (env === 'production') {
+      // 隔离 llmKey 变量：提供其余生产必填（对齐 loadSecret/loadTemplateDir 模式），
+      // 否则放行用例会因缺其它必填被误判 THREW。T07 起 AUTOFIGURE_SIDECAR_URL 同为生产
+      // enabled 必填，一并注入（该变量自身有独立 T07 describe 块）。
+      vi.stubEnv('JWT_SECRET', 's'.repeat(32))
+      vi.stubEnv('CREDENTIAL_ENCRYPTION_KEYS', Buffer.alloc(32, 0x01).toString('base64'))
+      vi.stubEnv('OPENCLAW_TEMPLATE_DIR', process.cwd())
+      vi.stubEnv('PANEL_PUBLIC_ORIGIN', 'https://panel.example.com')
+      vi.stubEnv('AUTOFIGURE_SIDECAR_URL', 'http://autofigure:8080')
+    }
+    if (key === undefined) delete process.env.AUTOFIGURE_LLM_KEY
+    else vi.stubEnv('AUTOFIGURE_LLM_KEY', key)
+    try {
+      const { config } = await import('../src/config')
+      return config.autofigure.llmKey
+    } catch (e) {
+      // fail-fast：错误消息须指向该 env（验收：生产 enabled+缺 key → 启动期 fail-fast 含 env 名）
+      if (env === 'production' && flag === 'true') expect((e as Error).message).toContain('AUTOFIGURE_LLM_KEY')
+      return 'THREW'
+    } finally {
+      vi.unstubAllEnvs() // 恢复 env（避免污染后续测试文件）
+    }
+  }
+
+  it('dev 缺省 → 空串（本地纯逻辑调试容忍）', async () => {
+    expect(await loadAutofigureLlmKey({})).toBe('')
+  })
+
+  it('dev 显式 key → 保留', async () => {
+    expect(await loadAutofigureLlmKey({ key: 'sk-dev-test' })).toBe('sk-dev-test')
+  })
+
+  it('生产 enabled + 缺 key → fail-fast（错误消息指向 AUTOFIGURE_LLM_KEY）', async () => {
+    expect(await loadAutofigureLlmKey({ env: 'production', flag: 'true', key: undefined })).toBe(
+      'THREW',
+    )
+  })
+
+  it('生产 enabled + 提供 key → 放行并返回', async () => {
+    expect(await loadAutofigureLlmKey({ env: 'production', flag: 'true', key: 'sk-prod' })).toBe(
+      'sk-prod',
+    )
+  })
+
+  it('生产 disabled + 缺 key → 容忍空串（flag 关不要求凭证）', async () => {
+    expect(await loadAutofigureLlmKey({ env: 'production', flag: 'false', key: undefined })).toBe('')
+  })
+})
+
+// T04（docs/autofigure/tickets/T04-timeout-reconcile-late-result.md）：AUTOFIGURE_JOB_TIMEOUT_MS ——
+// AutoFigure 执行超时（ms）。默认 30 分钟（config boundary 唯一声明处，runner 逻辑不硬编码生产
+// 超时）；超时自进入 running（startedAt）起算。非法值（非正整数）fail-fast（对齐
+// readDefaultMaxContainers 加载即校验）——否则错值静默按默认 30min 走，超时语义错配只在运行期暴露。
+describe('AutoFigure job timeout env (slice config, T04)', () => {
+  async function loadAutofigureJobTimeoutMs(env: string | undefined): Promise<number | 'THREW'> {
+    vi.resetModules() // 清 config 模块缓存，让动态 import 重新快照 env
+    if (env === undefined) delete process.env.AUTOFIGURE_JOB_TIMEOUT_MS
+    else vi.stubEnv('AUTOFIGURE_JOB_TIMEOUT_MS', env)
+    try {
+      const { config } = await import('../src/config')
+      return config.autofigure.jobTimeoutMs
+    } catch {
+      return 'THREW' // fail-fast
+    } finally {
+      vi.unstubAllEnvs() // 恢复 env（避免污染后续测试文件）
+    }
+  }
+
+  it('未设置 → 默认 30 分钟（30 * 60 * 1000 ms）', async () => {
+    expect(await loadAutofigureJobTimeoutMs(undefined)).toBe(30 * 60 * 1000)
+  })
+
+  it('显式正整数值 → 保留（测试注入短超时的管道）', async () => {
+    expect(await loadAutofigureJobTimeoutMs('50')).toBe(50)
+  })
+
+  it('非法 0 → fail-fast（超时须为正整数毫秒，防静默按默认 30min 走）', async () => {
+    expect(await loadAutofigureJobTimeoutMs('0')).toBe('THREW')
+  })
+
+  it('非法空串 → fail-fast（T10 compose 接线陷阱：`${VAR:-}` 无默认值注入空串 → Number(\'\')=0 静默按 0ms 走；须显式默认 1800000）', async () => {
+    expect(await loadAutofigureJobTimeoutMs('')).toBe('THREW')
+  })
+
+  it('非法非数 → fail-fast', async () => {
+    expect(await loadAutofigureJobTimeoutMs('abc')).toBe('THREW')
+  })
+})
+
+// T07（docs/autofigure/tickets/T07-autofigure-http-adapter.md）：AUTOFIGURE_SIDECAR_URL ——
+// 私有 AutoFigure sidecar 的 HTTP base URL（生产 HTTP adapter 唯一地址源，私有 sidecar 契约见
+// docs/autofigure/sidecar-contract.md）。flag 开 + 生产缺省/非法 URL → fail-fast（否则错配只在
+// enabled 时 adapter 构造/首请求才暴露——对齐 readPanelOrigin 前置校验模式）；dev/test 缺省容忍
+// 空串（装配测试经 DI 注入 sidecarUrl，不经 config）。只存 config.autofigure.sidecarUrl，由装配层
+// 注入生产 adapter；不落盘/不入日志。T07 不引入 adapter-local timeout——本 env 不承载超时语义
+//（sidecar 请求超时由 T04 AUTOFIGURE_JOB_TIMEOUT_MS 应用 runner 唯一承担）。
+describe('AutoFigure sidecar url env (slice config, T07)', () => {
+  async function loadAutofigureSidecarUrl(opts: {
+    env?: string
+    flag?: string | undefined
+    url?: string | undefined
+  }): Promise<string | 'THREW'> {
+    vi.resetModules() // 清 config 模块缓存，让动态 import 重新快照 env
+    const { env = 'development', flag, url } = opts
+    vi.stubEnv('NODE_ENV', env)
+    if (flag === undefined) delete process.env.AUTOFIGURE_ENABLED
+    else vi.stubEnv('AUTOFIGURE_ENABLED', flag)
+    if (env === 'production') {
+      // 隔离 sidecarUrl 变量：提供其余生产必填（对齐 loadAutofigureLlmKey 模式），否则放行用例
+      // 会因缺其它必填被误判 THREW。生产 enabled 下 AUTOFIGURE_LLM_KEY 同样必填，一并注入。
+      vi.stubEnv('JWT_SECRET', 's'.repeat(32))
+      vi.stubEnv('CREDENTIAL_ENCRYPTION_KEYS', Buffer.alloc(32, 0x01).toString('base64'))
+      vi.stubEnv('OPENCLAW_TEMPLATE_DIR', process.cwd())
+      vi.stubEnv('PANEL_PUBLIC_ORIGIN', 'https://panel.example.com')
+      vi.stubEnv('AUTOFIGURE_LLM_KEY', 'sk-prod')
+    }
+    if (url === undefined) delete process.env.AUTOFIGURE_SIDECAR_URL
+    else vi.stubEnv('AUTOFIGURE_SIDECAR_URL', url)
+    try {
+      const { config } = await import('../src/config')
+      return config.autofigure.sidecarUrl
+    } catch (e) {
+      // fail-fast：错误消息须指向该 env（验收：生产 enabled+缺/非法 → 启动期 fail-fast 含 env 名）
+      if (env === 'production' && flag === 'true') {
+        expect((e as Error).message).toContain('AUTOFIGURE_SIDECAR_URL')
+      }
+      return 'THREW'
+    } finally {
+      vi.unstubAllEnvs() // 恢复 env（避免污染后续测试文件）
+    }
+  }
+
+  it('dev 缺省 → 空串（本地纯逻辑调试/装配测试经 DI 注入容忍）', async () => {
+    expect(await loadAutofigureSidecarUrl({})).toBe('')
+  })
+
+  it('dev 显式 http URL → 保留', async () => {
+    expect(await loadAutofigureSidecarUrl({ url: 'http://autofigure:8080' })).toBe(
+      'http://autofigure:8080',
+    )
+  })
+
+  it('生产 enabled + 缺 URL → fail-fast（错误消息指向 AUTOFIGURE_SIDECAR_URL）', async () => {
+    expect(
+      await loadAutofigureSidecarUrl({ env: 'production', flag: 'true', url: undefined }),
+    ).toBe('THREW')
+  })
+
+  it('生产 enabled + 非法 URL（非完整 URL）→ fail-fast', async () => {
+    expect(
+      await loadAutofigureSidecarUrl({ env: 'production', flag: 'true', url: 'not a url' }),
+    ).toBe('THREW')
+  })
+
+  it('生产 enabled + 非 http(s) 协议 → fail-fast', async () => {
+    expect(
+      await loadAutofigureSidecarUrl({ env: 'production', flag: 'true', url: 'ftp://autofigure:8080' }),
+    ).toBe('THREW')
+  })
+
+  it('生产 enabled + 合法 http URL → 放行并返回', async () => {
+    expect(
+      await loadAutofigureSidecarUrl({ env: 'production', flag: 'true', url: 'http://autofigure:8080' }),
+    ).toBe('http://autofigure:8080')
+  })
+
+  it('生产 enabled + 合法 https URL → 放行并返回', async () => {
+    expect(
+      await loadAutofigureSidecarUrl({
+        env: 'production',
+        flag: 'true',
+        url: 'https://autofigure.example.com',
+      }),
+    ).toBe('https://autofigure.example.com')
+  })
+
+  it('生产 disabled + 缺 URL → 容忍空串（flag 关不要求 sidecar 地址）', async () => {
+    expect(
+      await loadAutofigureSidecarUrl({ env: 'production', flag: 'false', url: undefined }),
+    ).toBe('')
+  })
+})

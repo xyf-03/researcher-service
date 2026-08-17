@@ -11,14 +11,13 @@
 // 顺序陷阱（#315 §0）：name 非法 ≠ name 合法但无此容器，两码不可混。
 
 import { Router, type Request, type Response } from 'express'
-import path from 'node:path'
 import { fail, ok } from '../envelope'
 import { CODE } from '../codes'
 import { requireAuth } from '../middleware/auth'
 import { mustChangePasswordGate } from '../middleware/mustChangePasswordGate'
 import { getInstanceForUser } from '../containers/orchestrator'
 import { CONTAINER_NAME_REGEX } from '../validation/schemas'
-import { NodeWikiFileSystem } from './nodeFs'
+import { DockerWikiFileSystem } from './dockerFs'
 import { WikiService } from './service'
 import { WikiInvalidPath, WikiPageExists, WikiPageNotFound } from './errors'
 import { parseWikiWriteBody, requireRelPath } from './paths'
@@ -27,6 +26,9 @@ import { noopCompile, type CompileTrigger } from './compile'
 export interface WikiRouterDeps {
   // compile 触发（#315 §6）：POST/DELETE 触发、PUT 不触发、5s 去抖。缺省 = 无编排 no-op。
   compile?: CompileTrigger
+  // service 工厂（#621 · ADR 0012 wiki 收口）：缺省 = Docker 适配器（getArchive/putArchive/exec rm
+  // 读写容器内 ~/.openclaw/wiki/main，named volume / bind 两拓扑通用）；测试注入内存 fake。
+  serviceFor?: (inst: { name: string; homeDir: string }) => WikiService
 }
 
 // 页级域错误 → 信封（30040 / 90002+data.path）；其余上抛走统一错误面。
@@ -38,6 +40,10 @@ function assertPageOpError(err: unknown): void {
 
 export function createWikiRouter(deps: WikiRouterDeps = {}): Router {
   const compile = deps.compile ?? noopCompile
+  // 缺省经 Docker 原语读写容器内 wiki（#621）：inst.homeDir（DB 记账的宿主路径）不再被 wiki
+  // 使用——named volume 拓扑下该路径在控制面文件系统不存在；DB 字段保留（编排删除清理仍用）。
+  const serviceFor =
+    deps.serviceFor ?? ((inst: { name: string }) => new WikiService(new DockerWikiFileSystem(inst.name)))
   const router = Router()
   router.use(requireAuth, mustChangePasswordGate)
 
@@ -51,13 +57,11 @@ export function createWikiRouter(deps: WikiRouterDeps = {}): Router {
     }
     return getInstanceForUser(req.prisma, req.user!, name)
   }
-  const makeService = (homeDir: string): WikiService =>
-    new WikiService(new NodeWikiFileSystem(path.join(homeDir, 'wiki', 'main')))
 
   // GET /:name/wiki/tree —— 文件树（开放目录分组；不收顶层散落页）。
   router.get('/:name/wiki/tree', async (req: Request, res: Response) => {
     const inst = await resolveInstance(req, req.params.name)
-    ok(res, await makeService(inst.homeDir).buildTree())
+    ok(res, await serviceFor(inst).buildTree())
   })
 
   // GET /:name/wiki/page?path= —— 读一页原文全文。
@@ -65,7 +69,7 @@ export function createWikiRouter(deps: WikiRouterDeps = {}): Router {
     const inst = await resolveInstance(req, req.params.name)
     const relPath = requireRelPath(req.query.path) // 非法 → 90002(data.path)；在容器/越权校验之后
     try {
-      ok(res, await makeService(inst.homeDir).readPage(relPath))
+      ok(res, await serviceFor(inst).readPage(relPath))
     } catch (err) {
       assertPageOpError(err)
     }
@@ -76,7 +80,7 @@ export function createWikiRouter(deps: WikiRouterDeps = {}): Router {
     const inst = await resolveInstance(req, req.params.name)
     const body = parseWikiWriteBody(req.body) // 非法 → 90002；在容器/越权校验之后（对齐 Django 顺序）
     try {
-      await makeService(inst.homeDir).writePage(body.path, body.content)
+      await serviceFor(inst).writePage(body.path, body.content)
     } catch (err) {
       assertPageOpError(err)
     }
@@ -88,7 +92,7 @@ export function createWikiRouter(deps: WikiRouterDeps = {}): Router {
     const inst = await resolveInstance(req, req.params.name)
     const body = parseWikiWriteBody(req.body)
     try {
-      await makeService(inst.homeDir).createPage(body.path, body.content)
+      await serviceFor(inst).createPage(body.path, body.content)
     } catch (err) {
       if (err instanceof WikiPageExists) throw fail(CODE.WIKI_PAGE_EXISTS)
       assertPageOpError(err)
@@ -102,7 +106,7 @@ export function createWikiRouter(deps: WikiRouterDeps = {}): Router {
     const inst = await resolveInstance(req, req.params.name)
     const relPath = requireRelPath(req.query.path)
     try {
-      await makeService(inst.homeDir).deletePage(relPath)
+      await serviceFor(inst).deletePage(relPath)
     } catch (err) {
       assertPageOpError(err)
     }
@@ -113,13 +117,13 @@ export function createWikiRouter(deps: WikiRouterDeps = {}): Router {
   // GET /:name/wiki/graph —— 全库图谱（nodes + edges；边不 dedup、不可解析 → ghost 节点）。
   router.get('/:name/wiki/graph', async (req: Request, res: Response) => {
     const inst = await resolveInstance(req, req.params.name)
-    ok(res, await makeService(inst.homeDir).buildGraph())
+    ok(res, await serviceFor(inst).buildGraph())
   })
 
   // GET /:name/wiki/categories —— 按 `category:` 标记聚合（开放词表；收顶层散落页）。
   router.get('/:name/wiki/categories', async (req: Request, res: Response) => {
     const inst = await resolveInstance(req, req.params.name)
-    ok(res, await makeService(inst.homeDir).listCategories())
+    ok(res, await serviceFor(inst).listCategories())
   })
 
   return router

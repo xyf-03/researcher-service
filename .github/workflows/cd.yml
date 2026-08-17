@@ -2,8 +2,15 @@
 #
 # 触发：CI 在 master 上成功完成后（workflow_run），保证「不部署红码」。
 # 镜像：server（TS/Express 控制面，替代退役的 Django backend，#341 M9）+ frontend（Vue/Vite→nginx）
-# 双镜像，tag `:latest` + `:<CI head_sha>`（head_sha 取自通过的 CI run，使 latest/sha 精确对应该
-# commit，便于 :sha 回滚）。
+# + openclaw（自建派生 OpenClaw 镜像，issue #588：pdftotext + wiki/workspace 骨架，ADR 0011/0013）
+# + autofigure（AutoFigure sidecar，T08/T11：Python + Playwright chromium 构建期 + vendored 上游 +
+# 许可/署名文件；构建源 = deploy/autofigure-sidecar，**不 fetch mutable upstream**）
+# 四镜像，tag `:latest` + `:<CI head_sha>`（head_sha 取自通过的 CI run，使 latest/sha 精确对应该
+# commit，便于 :sha 回滚）。server 镜像构建期经 buildx 多 context 注入 home 模板（researcher 克隆）
+# 与 deploy/openclaw.json（ADR 0013：#593 模板入镜像，生产不再挂载任何宿主数据路径）；server 容器
+# 运行时经 OPENCLAW_IMAGE 默认值拉派生 openclaw 镜像。autofigure 镜像运行时经 compose
+# PANEL_AUTOFIGURE_IMAGE 默认值引用（T11）。AUTOFIGURE_LLM_KEY 为可选 secret（flag 关空串安全，
+# 经渲染 .env 注入 server；不落盘 git、不进日志）。
 # 部署：appleboy/scp-action 推 compose + 渲染 .env → /www/panel；appleboy/ssh-action 远端
 # docker login（持久，供运行时 OpenClaw 拉取复用宿主 daemon 凭证）→ pull → up -d → prune → /api/health 健康门。
 #
@@ -11,7 +18,8 @@
 #   REMOTE_HOST REMOTE_USER DEPLOY_KEY            —— SSH 登录宿主
 #   GHCR_PULL_USER GHCR_PULL_TOKEN                —— 宿主拉私有 GHCR（read:packages PAT）
 #   JWT_SECRET PANEL_PUBLIC_ORIGIN LLM_API_KEY CREDENTIAL_ENCRYPTION_KEYS —— server 运行时
-#   RESEARCHER_REPO（可选，默认 https://github.com/ACautomata/researcher.git）
+#   AUTOFIGURE_LLM_KEY（可选，flag 开才必需；缺失不导致部署失败）—— AutoFigure 生成凭证，经渲染 .env 注入
+#   RESEARCHER_REPO（可选，默认 https://github.com/ACautomata/researcher.git）—— 构建机 clone home 模板
 
 name: CD
 
@@ -57,21 +65,45 @@ jobs:
           echo "IMAGE_REPO=${IMAGE_REPO}" >> "$GITHUB_ENV"
           echo "SERVER_IMAGE=ghcr.io/${IMAGE_REPO}/server" >> "$GITHUB_ENV"
           echo "FRONTEND_IMAGE=ghcr.io/${IMAGE_REPO}/frontend" >> "$GITHUB_ENV"
+          # openclaw 派生镜像（issue #588）：server config.ts OPENCLAW_IMAGE 默认值指向它的 :latest
+          echo "OPENCLAW_IMAGE=ghcr.io/${IMAGE_REPO}/openclaw" >> "$GITHUB_ENV"
+          # autofigure sidecar 镜像（T11）：compose PANEL_AUTOFIGURE_IMAGE 默认值指向它的 :latest
+          echo "AUTOFIGURE_IMAGE=ghcr.io/${IMAGE_REPO}/autofigure" >> "$GITHUB_ENV"
 
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
 
       - name: Log in to GHCR (push)
-        uses: docker/login-action@371161bbe7024a29a25c5e19bfcbc0804fe9ad2c  # v4.5.2
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Clone researcher home template (build-time, ADR 0013)
+        # issue #593：home 模板构建期 clone 并作为 buildx 多 context 注入 server 镜像
+        # （Dockerfile COPY --from=template），不再 scp/挂载到宿主 /srv/openclaw/template。
+        # 每次构建 clone 最新 → 模板随镜像 :sha 版本化（回滚镜像即回滚模板）；
+        # clone 失败即构建失败 → CD 红（模板是构建必需，不带病出镜像）。
+        # 清理 .git：COPY --from=template 整棵入镜像 + provision cp -a 会一并拷进容器
+        # ~/.openclaw/.git（模板只作内容源，版本由镜像 :sha 记录，无需携带仓库元数据）。
+        env:
+          RESEARCHER_REPO: ${{ secrets.RESEARCHER_REPO }}
+        run: |
+          REPO="${RESEARCHER_REPO:-https://github.com/ACautomata/researcher.git}"
+          git clone --depth 1 "$REPO" "${{ github.workspace }}/_templates/researcher"
+          rm -rf "${{ github.workspace }}/_templates/researcher/.git"
 
       - name: Build & push server image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
         with:
           context: server
           file: server/Dockerfile
+          # 多 context（buildx named context，Dockerfile 以 COPY --from=<name> 消费）：
+          #   template=researcher 克隆（home 模板，ADR 0013 入镜像）
+          #   deploy=本仓库 deploy/（openclaw.json 配置单一来源入镜像）
+          build-contexts: |
+            template=${{ github.workspace }}/_templates/researcher
+            deploy=${{ github.workspace }}/deploy
           push: true
           tags: |
             ${{ env.SERVER_IMAGE }}:latest
@@ -91,6 +123,38 @@ jobs:
           cache-from: type=gha,scope=frontend
           cache-to: type=gha,mode=max,scope=frontend
 
+      - name: Build & push openclaw derived image (issue #588)
+        # 自建派生镜像：FROM 官方 2026.7.1-browser，叠加 pdftotext + wiki/workspace 骨架
+        # （ADR 0011/0013）。构建期断言在 Dockerfile RUN 内（pdftotext 可用 + 骨架齐全），
+        # 任一失败即构建失败 → CD 红，不带病推送。
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
+        with:
+          context: deploy/openclaw-image
+          file: deploy/openclaw-image/Dockerfile
+          push: true
+          tags: |
+            ${{ env.OPENCLAW_IMAGE }}:latest
+            ${{ env.OPENCLAW_IMAGE }}:${{ env.IMAGE_TAG }}
+          cache-from: type=gha,scope=openclaw
+          cache-to: type=gha,mode=max,scope=openclaw
+
+      - name: Build & push autofigure sidecar image (T08/T11)
+        # AutoFigure sidecar：构建源 deploy/autofigure-sidecar（vendored T08 源，不 fetch
+        # mutable upstream）。Dockerfile 构建期断言 + 许可/署名文件（LICENSE / CITATION.cff /
+        # CITATION_AND_ATTRIBUTION.md / TRADEMARK.md）入镜像，任一缺失构建即失败 → CD 红。
+        # 对齐既有 server/frontend/openclaw 模式（GHCR login / buildx / cache scope / tag 惯例）；
+        # compose 经 PANEL_AUTOFIGURE_IMAGE 默认值引用（:latest / :<sha> 回滚）。
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
+        with:
+          context: deploy/autofigure-sidecar
+          file: deploy/autofigure-sidecar/Dockerfile
+          push: true
+          tags: |
+            ${{ env.AUTOFIGURE_IMAGE }}:latest
+            ${{ env.AUTOFIGURE_IMAGE }}:${{ env.IMAGE_TAG }}
+          cache-from: type=gha,scope=autofigure
+          cache-to: type=gha,mode=max,scope=autofigure
+
       - name: Stage deploy artifacts (compose + rendered .env)
         # 运行时敏感值渲染为 .env（compose env_file 读取）；.env 不进 git，仅经 scp 落到宿主。
         # 两个文件先汇入扁平 staging 目录，scp 以 strip_components=1 整目录平铺到 /www/panel/ 根部，
@@ -98,11 +162,9 @@ jobs:
         run: |
           mkdir -p _deploy
           cp deploy/docker-compose.deploy.yml _deploy/
-          # openclaw.json 模板（配置单一来源）：随 compose 一并分发，compose 挂载进 server 容器
-          # 覆盖镜像内不存在的默认路径（见 compose OPENCLAW_TEMPLATE_JSON）。server 镜像构建
-          # context=server 不含 deploy/，镜像内 TEMPLATE_JSON 默认路径 <cwd>/../deploy 不存在 →
-          # 首次创建容器即 90003；此处分发保证宿主机 /www/panel/openclaw.json 存在。
-          cp deploy/openclaw.json _deploy/openclaw.json
+          # openclaw.json 模板（配置单一来源）不再随 CD 分发：#593（ADR 0013）构建期 COPY 进
+          # server 镜像（上方 build-contexts deploy=），compose OPENCLAW_TEMPLATE_JSON 指向镜像内
+          # /app/deploy/openclaw.json。
           # 命名 .env：compose 变量替换（$PANEL_SERVER_IMAGE 等）与 env_file 都自动读它，
           # v1/v2 CLI 行为一致（--env-file 仅 v2 且只管 env_file 不管替换；v1 缺 .env 直接报错）。
           # #341 M9：DJANGO_SECRET_KEY → JWT_SECRET（server config.ts 生产必填 ≥32 字符），
@@ -112,8 +174,15 @@ jobs:
             echo "PANEL_PUBLIC_ORIGIN=${{ secrets.PANEL_PUBLIC_ORIGIN }}"
             echo "LLM_API_KEY=${{ secrets.LLM_API_KEY }}"
             echo "CREDENTIAL_ENCRYPTION_KEYS=${{ secrets.CREDENTIAL_ENCRYPTION_KEYS }}"
+            # AUTOFIGURE_LLM_KEY 可选 secret：flag 关（生产默认）空串安全——config 只在
+            # enabled && production 下 fail-fast，缺失不导致部署失败；flag 开则宿主 .env 设
+            # AUTOFIGURE_ENABLED=true 时必需。经 env_file .env 注入 server，不落盘 git/不进日志。
+            echo "AUTOFIGURE_LLM_KEY=${{ secrets.AUTOFIGURE_LLM_KEY }}"
             echo "PANEL_SERVER_IMAGE=${{ env.SERVER_IMAGE }}:latest"
             echo "PANEL_FRONTEND_IMAGE=${{ env.FRONTEND_IMAGE }}:latest"
+            # autofigure 镜像覆盖位（对齐 PANEL_*_IMAGE 先例）：生产 compose 默认值指向
+            # ghcr.io/.../autofigure:latest，回滚固定到 :<sha>（env.IMAGE_TAG 已入 tags）。
+            echo "PANEL_AUTOFIGURE_IMAGE=${{ env.AUTOFIGURE_IMAGE }}:latest"
           } > _deploy/.env
           chmod 600 _deploy/.env
 
@@ -133,24 +202,19 @@ jobs:
         env:
           GHCR_PULL_USER: ${{ secrets.GHCR_PULL_USER }}
           GHCR_PULL_TOKEN: ${{ secrets.GHCR_PULL_TOKEN }}
-          RESEARCHER_REPO: ${{ secrets.RESEARCHER_REPO }}
+          OPENCLAW_IMAGE: ${{ env.OPENCLAW_IMAGE }}
         with:
           host: ${{ secrets.REMOTE_HOST }}
           username: ${{ secrets.REMOTE_USER }}
           key: ${{ secrets.DEPLOY_KEY }}
-          envs: GHCR_PULL_USER,GHCR_PULL_TOKEN,RESEARCHER_REPO
+          envs: GHCR_PULL_USER,GHCR_PULL_TOKEN,OPENCLAW_IMAGE
           script: |
             set -euo pipefail
 
             APP_DIR=/www/panel
-            TEMPLATE_DIR=/srv/openclaw/template
-            # 防御性 bootstrap：缺则建（首次部署）；后续幂等。
-            mkdir -p "$APP_DIR" /srv/openclaw
-            if [ ! -d "$TEMPLATE_DIR/.git" ]; then
-              echo "[deploy] cloning researcher template -> $TEMPLATE_DIR"
-              rm -rf "$TEMPLATE_DIR"
-              git clone --depth 1 "${RESEARCHER_REPO:-https://github.com/ACautomata/researcher.git}" "$TEMPLATE_DIR"
-            fi
+            # 防御性 bootstrap：缺则建（首次部署）；后续幂等。home 模板不再落宿主
+            # （ADR 0013：#593 构建期入 server 镜像，见构建步骤 clone + build-contexts）。
+            mkdir -p "$APP_DIR"
 
             # 持久登录 ghcr：deploy 拉面板镜像 + 运行时后端经宿主 daemon 拉 OpenClaw 镜像共用此凭证。
             echo "$GHCR_PULL_TOKEN" | docker login ghcr.io -u "$GHCR_PULL_USER" --password-stdin
@@ -160,6 +224,12 @@ jobs:
             # compose.yml/docker-compose.yml），缺 -f 会让 pull/up 报
             # "no configuration file provided: not found"。
             docker compose -f docker-compose.deploy.yml pull
+            # 运行时镜像验证 + 刷新 :latest 缓存（issue #588 派生镜像，私有 GHCR 包）：
+            # ① server 容器经 dockerode 裸 pull（无 X-Registry-Auth）取 daemon 侧凭据——此步验证
+            #    该路径可用（/api/health 绿但首次 create 401 的部署假绿即由此排除）；
+            # ② ensureImage 仅在本地缺失时拉取，:latest 被宿主缓存一次后 CD 新推送永远到不了
+            #    fleet——此步显式重拉，保证新容器跑到当前发布。
+            docker pull "${OPENCLAW_IMAGE}:latest"
             docker compose -f docker-compose.deploy.yml up -d --remove-orphans
             docker image prune -f
 

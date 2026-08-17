@@ -17,6 +17,7 @@ describe('页面路由按需加载', () => {
       'categories',
       'chat',
       'containers',
+      'figures',
       'legal-document',
       'login',
       'models',

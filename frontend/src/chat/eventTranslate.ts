@@ -5,8 +5,17 @@
 
 // 翻译输出的渲染帧（对齐 ChatView 现有 onText/onDone/onError/onApproval/onApprovalResolved/onTool 签名）。
 export type ChatFrame =
-  | { type: 'text'; runId: string; delta: string; replace?: boolean }
-  | { type: 'done'; runId: string }
+  // #565: thinking?: string | null —— 结构化 thinking 块提取（方案 A：翻译层提取随帧携带）。
+  // 仅在 replace 快照 / final 帧可能非 undefined；delta 增量帧恒 undefined（增量字段是纯文本串，
+  // 无 content[]），消费端对 undefined 跳过覆盖、走内联 <thinking> 路（splitThinking）现状。
+  | { type: 'text'; runId: string; delta: string; replace?: boolean; thinking?: string | null }
+  // #565: done 帧可携带 thinking——final 权威文本与流式累积相等/无文本（thinking-only）时翻译层
+  // 不产 text 帧（无帧可挂），经 done 帧独立数据通道携带（不经 handleText 的 raw 逻辑，与
+  // attachment 帧同哲学；不等价于谎报文本变更的 replace 帧）
+  // #569: message?: unknown —— 外来 run 可见 final 的归约权威消息本体（#560 currentRun.message）
+  // 透出数据通道。翻译层无外来概念（纯函数），有归约 message 即带；消费端仅 handleDone 外来分支
+  // 读该字段做局部插入，本 run final 分支沿用现有 tail 补发逻辑、不读。
+  | { type: 'done'; runId: string; thinking?: string | null; message?: unknown }
   // runId 可选：run 级错误挂 runId（前端按 runId 过滤）；无 runId 为连接/会话级错误（照常显示）
   | { type: 'error'; runId?: string; message: string }
   | { type: 'approval'; id: string; kind: string; command: string; sessionKey: string | null; agentId: string | null }
@@ -66,24 +75,93 @@ export function extractMessageText(message: unknown): string {
   return ''
 }
 
+// #565 结构化 thinking 块提取（对齐官方 message-extract.ts extractThinking，C 档自写）：
+// 取 message.content[] 里 type==='thinking' 块的 thinking 字段（string 才取）、逐块 trim、丢空串、
+// 多块 '\n' join；全空/无块/content 非数组/message 非对象 → null（区别于 extractMessageText 的 ''）。
+// 0 信任：非对象 message / 块非对象 / thinking 非 string 一律跳过。**不读 text 字段兜底**（官方只读
+// thinking；无实测证据不预设变体）。与内联 <thinking> 标签剥离（thinking.ts splitThinking）双路并存、
+// 各司其职——本函数作用在结构化 content[] 块，splitThinking 作用在累积内联标签文本串。
+export function extractThinking(message: unknown): string | null {
+  if (!message || typeof message === 'string') return null
+  const obj = asRecord(message)
+  const content = obj.content
+  if (!Array.isArray(content)) return null
+  const parts: string[] = []
+  for (const block of content) {
+    if (!block || typeof block !== 'object') continue
+    const b = asRecord(block)
+    if (b.type !== 'thinking') continue
+    if (typeof b.thinking !== 'string') continue
+    const cleaned = b.thinking.trim()
+    if (cleaned) parts.push(cleaned)
+  }
+  return parts.length > 0 ? parts.join('\n') : null
+}
+
 // ---- #459-T3 #464：附件块提取（与 extractMessageText 并列的独立数据通道）----
 // 历史消息（loadHistory）与流式消息（final/delta replace 快照）中的 image/audio/video 内容块
 // → 渲染媒体数据。附件块此前被渲染层丢弃（extractMessageText 只认 text 块），本函数补齐非 text
 // 媒体块的提取。**文本与附件不互相污染**：extractMessageText 仍只含 text 块（摘要/审计/claimedEmpty
 // 判定等文本用途），媒体块只经本函数进 Msg.media，不进 Msg.text。
 // 块 type 是归类依据（0 信任：mimeType 前缀与块 type 不一致时按块 type 归类，不猜测）。
+// #568: 附件元数据增强——type 扩 document + sizeBytes/durationMs/width/height/label（全可选条件
+// 透传：有才带上、缺则不带）。src 语义扩为「纯 base64 或完整 url」（url 形态块直存完整 url，
+// 组件侧 mediaSrc 按 http(s) 前缀原样返回、不拼 base64）。
 export interface MediaBlock {
-  type: 'image' | 'audio' | 'video'
+  type: 'image' | 'audio' | 'video' | 'document'
   mimeType: string
-  src: string // 纯 base64（剥 data:...;base64, 前缀）；组件侧重建完整 dataURL 供 <img>/<audio>/<video>
+  src: string // 纯 base64（剥 data:...;base64, 前缀）或完整 url；组件侧重建完整 dataURL 供
+              // <img>/<audio>/<video>/<a download>（document 下载卡）
   fileName?: string // 原始文件名（有则供下载/无障碍标注）
+  label?: string // 展示名（优先于 fileName，document 下载卡主标题）
+  sizeBytes?: number // 体积（字节），条件透传
+  durationMs?: number // 时长（毫秒），条件透传
+  width?: number // 像素宽（仅 image/video 有意义），条件透传
+  height?: number // 像素高（同上），条件透传
+}
+const MEDIA_TYPES = ['image', 'audio', 'video', 'document'] as const
+
+// #568: 附件展示元数据条件透传（提取两路共用，防 drift）——官方「有才带上」同构（规格 §4.2/§4.3）：
+// fileName/label 须非空 string；sizeBytes/durationMs 须为非负 number；width/height 须为正 number
+// （0/负为无意义值）。非法值一律不带（0 信任，网关不回填则与现状一致）。
+function mediaMeta(b: Record<string, unknown>): {
+  fileName?: string
+  label?: string
+  sizeBytes?: number
+  durationMs?: number
+  width?: number
+  height?: number
+} {
+  return {
+    ...(typeof b.fileName === 'string' && b.fileName ? { fileName: b.fileName } : {}),
+    ...(typeof b.label === 'string' && b.label ? { label: b.label } : {}),
+    ...(typeof b.sizeBytes === 'number' && b.sizeBytes >= 0 ? { sizeBytes: b.sizeBytes } : {}),
+    ...(typeof b.durationMs === 'number' && b.durationMs >= 0 ? { durationMs: b.durationMs } : {}),
+    ...(typeof b.width === 'number' && b.width > 0 ? { width: b.width } : {}),
+    ...(typeof b.height === 'number' && b.height > 0 ? { height: b.height } : {}),
+  }
 }
 
-const MEDIA_TYPES = ['image', 'audio', 'video'] as const
+// #568 安全修复（security review）：url 形态只收**完整 http(s) URL**——在单一提取 choke point 校验
+// （new URL 可解析且协议为 http:/https:），其他 scheme（javascript:/file:/data: 等）、相对/协议相对
+// url、畸形 url 一律跳过。渲染层（img/audio/video 自动加载、document href）拿到的 url 恒为 http(s)。
+function isSafeHttpUrl(value: unknown): value is string {
+  if (typeof value !== 'string' || !value) return false
+  try {
+    const u = new URL(value)
+    return u.protocol === 'http:' || u.protocol === 'https:'
+  } catch {
+    return false
+  }
+}
 
-// 从 message.content[] 提取 image/audio/video 块 → MediaBlock[]（渲染数据）。
-// 0 信任：仅取 string content（纯 base64）的块；缺失/非 string/空 content 跳过。
+// 从 message.content[] 提取 image/audio/video/document 块 → MediaBlock[]（渲染数据）。
+// 0 信任：content/url 缺失或非 string → 跳过。块 type 是归类依据；mimeType 缺失回退 `${type}/*`。
 // content 多态同 extractMessageText（string message / 无 content → 无附件）。
+// #568: 三种来源形态——① b.content 裸 base64（含 document 型，同形状条件透传元数据）；
+// ② {type:'attachment', attachment:{kind,url,...}}（官方 (a) 路）；③ {type:audio|video|document,
+// url}（官方 (b) 路，src 直存完整 url）。②③ 为纯防御：面板 history 未实测此形态，条件透传保证
+// 「无此形态则零影响」。
 export function extractMessageAttachments(message: unknown): MediaBlock[] {
   if (!message || typeof message === 'string') return []
   const obj = asRecord(message)
@@ -93,17 +171,38 @@ export function extractMessageAttachments(message: unknown): MediaBlock[] {
   for (const block of content) {
     if (!block || typeof block !== 'object') continue
     const b = asRecord(block)
+    // ②: {type:'attachment', attachment:{kind,url,...}}——kind 是类型归类依据（官方 (a) 路）
+    if (b.type === 'attachment') {
+      const att = asRecord(b.attachment)
+      const kind = typeof att.kind === 'string' ? att.kind : ''
+      if ((MEDIA_TYPES as readonly string[]).includes(kind)) {
+        const src = isSafeHttpUrl(att.url) ? att.url : ''
+        if (!src) continue
+        const mimeType = typeof att.mimeType === 'string' && att.mimeType ? att.mimeType : `${kind}/*`
+        out.push({
+          type: kind as MediaBlock['type'],
+          mimeType,
+          src,
+          ...mediaMeta(att),
+        })
+      }
+      continue
+    }
     const type = typeof b.type === 'string' ? b.type : ''
     if (!(MEDIA_TYPES as readonly string[]).includes(type)) continue
-    const src = typeof b.content === 'string' ? b.content : ''
-    if (!src) continue // 无 string base64 内容 → 无法渲染，跳过
+    // ①: b.content 裸 base64 优先（现有路）；③: 无 content 时退 url 形态（{type:audio|video|document,
+    // url}，官方 (b) 路）——src 直存完整 http(s) url，组件侧 mediaSrc 原样返回不拼 base64
+    const contentStr = typeof b.content === 'string' ? b.content : ''
+    const url = contentStr ? '' : (isSafeHttpUrl(b.url) ? b.url : '')
+    const src = contentStr || url
+    if (!src) continue // 无 string content/url → 无法渲染，跳过
     // mimeType 缺失/非 string → 回退 `${type}/*`（组件重建完整 dataURL 须有 mime 段）。
     const mimeType = typeof b.mimeType === 'string' && b.mimeType ? b.mimeType : `${type}/*`
     out.push({
       type: type as MediaBlock['type'],
       mimeType,
       src,
-      ...(typeof b.fileName === 'string' && b.fileName ? { fileName: b.fileName } : {}),
+      ...mediaMeta(b),
     })
   }
   return out
@@ -113,12 +212,20 @@ export function extractMessageAttachments(message: unknown): MediaBlock[] {
 // 与 extractMessageAttachments 共用同一 MediaBlock 投影，避免发送 echo（useChatConnection.send）与
 // 历史/流式提取两路各自重写「mimeType 主段派生 type / string content 门 / fileName 条件拷贝」而 drift
 // （code-review Standards 轴）。content 非 string/空 → null（该附件无 echo 渲染数据，跳过）。
-// 块 type 取自 a.type（采集层已校验白名单 image/audio/video）；mimeType 缺失回退 `${type}/*`。
+// 块 type 取自 a.type（采集层已校验白名单 image/audio/video；document 属函数级防御，采集层暂不放行）；
+// mimeType 缺失回退 `${type}/*`。
+// #568: 补透传 sizeBytes/durationMs/width/height（Attachment 已在 attachments.ts 声明，buildAttachments
+// 原样透传——§2.1 数据已确证在 wire 上，此前被本函数丢弃）——与 extractMessageAttachments 共用
+// mediaMeta 条件透传判定，防两路 drift。
 export function attachmentToMediaBlock(a: {
   type?: string
   mimeType?: string
   fileName?: string
   content?: unknown
+  sizeBytes?: number
+  durationMs?: number
+  width?: number
+  height?: number
 }): MediaBlock | null {
   const type = typeof a.type === 'string' ? a.type : ''
   if (!(MEDIA_TYPES as readonly string[]).includes(type)) return null
@@ -129,7 +236,7 @@ export function attachmentToMediaBlock(a: {
     type: type as MediaBlock['type'],
     mimeType,
     src,
-    ...(typeof a.fileName === 'string' && a.fileName ? { fileName: a.fileName } : {}),
+    ...mediaMeta(a),
   }
 }
 
@@ -265,10 +372,25 @@ export class ChatEventTranslator {
   private translateDelta(runId: string, payload: Record<string, unknown>): ChatFrame[] {
     if (payload.replace) {
       const snapshot = extractMessageText(payload.message)
+      // #565: 结构化 thinking 块（replace 快照 content[]）随帧携带；无块（null）不挂字段
+      const thinking = extractThinking(payload.message)
       if (snapshot) {
         // replace=true + 快照：整段替换（前缀/非前缀均正确）。前端按 replace 标志 set 而非 append
         this.sent.set(runId, snapshot)
-        return [{ type: 'text', runId, delta: snapshot, replace: true }]
+        return [
+          {
+            type: 'text',
+            runId,
+            delta: snapshot,
+            replace: true,
+            ...(thinking !== null ? { thinking } : {}),
+          },
+        ]
+      }
+      if (thinking !== null) {
+        // #565: thinking-only replace 快照（思考先于正文的模型输出）：无文本可渲染——发 delta=''
+        // 增量帧携带思考（delta='' 不改变前端 raw 累积，仅覆盖 thinking；sent 不更新）。
+        return [{ type: 'text', runId, delta: '', thinking }]
       }
       // #459-T3 #464：replace 快照无文本但含媒体块（纯图片 run 的流式快照）→ 产 attachment 帧，
       // 不回退 deltaText（媒体块不在 deltaText 增量字段里）。
@@ -298,23 +420,39 @@ export class ChatEventTranslator {
     // #560: 终态 message 来源从 payload.message 换成归约后的 currentRun.message（SDK updateRun 已把
     //「delta 期快照 → final 权威 message」归一，含「final 无 message 时沿用 delta 快照」的保留逻辑）——
     // 替换散在 delta-replace 快照与 final 提取两处的 message 归一化（规格 §2.2）。
-    const message = extractMessageText(run.message ?? payload.message)
+    // 局部提升：文本/思考/附件三路共用同一 message 来源（防多点漂移，code-review）
+    const rawMessage = run.message ?? payload.message
+    const message = extractMessageText(rawMessage)
+    // #565: 结构化 thinking 块提取（final 权威 content[]）——随产出的 text 帧携带（handleText 以
+    // ?? 覆盖内联剥离结果）；null = 无结构化块，帧不挂字段（增量帧/无块帧保持现状）。
+    const structThinking = extractThinking(rawMessage)
     const sent = this.sent.get(runId) ?? ''
     // final.message 可能含此前未在 delta 投递的尾部文本 → 先补 text 再收尾（r13:128-129）
     if (message && message.startsWith(sent) && message.length > sent.length) {
       const tail = message.slice(sent.length)
       this.sent.set(runId, sent + tail)
-      out.push({ type: 'text', runId, delta: tail })
+      out.push({
+        type: 'text',
+        runId,
+        delta: tail,
+        ...(structThinking !== null ? { thinking: structThinking } : {}),
+      })
     } else if (message && !message.startsWith(sent)) {
       // F9: 非前缀 final（空白规范化 / markdown 改写 / 重复 delta 使 sent 翻倍）——权威最终文本与
       // 流式累积不一致。若只发 done，权威文本被静默丢弃、UI 停在未规范化的流式态。发整段 replace
       // 帧（协议支持 replace 快照；前端按 replace 标志 set 而非 append），纠正流式投影。
       this.sent.set(runId, message)
-      out.push({ type: 'text', runId, delta: message, replace: true })
+      out.push({
+        type: 'text',
+        runId,
+        delta: message,
+        replace: true,
+        ...(structThinking !== null ? { thinking: structThinking } : {}),
+      })
     }
     // #459-T3 #464：final.message 含 image/audio/video 块（browser 截图/AI 工具产出多媒体）→
     // 产 attachment 帧（权威最终媒体，与 text 帧独立通道）。纯媒体 run（无文本）也经此渲染。
-    const media = extractMessageAttachments(run.message ?? payload.message)
+    const media = extractMessageAttachments(rawMessage)
     if (media.length) out.push({ type: 'attachment', runId, media })
     // #560: error/timeout 细分——译成 error 帧而非 done（规格 §2.1 三分支坍成「读 currentRun.status
     // 一个 switch」的 error 分支）。尾部/媒体已先行补发（权威内容不丢，同 done 收尾路径）。
@@ -324,7 +462,19 @@ export class ChatEventTranslator {
       const message = run.errorMessage ?? run.errorKind ?? 'run 执行失败'
       return [...out, { type: 'error', runId, message }]
     }
-    out.push({ type: 'done', runId })
+    // #565: done 帧携带结构化 thinking——final 权威文本与流式累积相等/无文本（thinking-only）时
+    // 本分支未产 text 帧（tail/replace 已带 thinking 时无需重复）；思考常只在 final 的 content[]
+    // 才出现（delta 增量是纯文本串），经 done 帧独立通道携带（消费端 handleDone 在 finalizeLast
+    // 前写入，terminal 重解析为空时保留——不谎报文本变更，不经 handleText 的 raw 逻辑）。
+    // #569: 归约权威 message 透出（外来可见 final 局部插入的数据通道；本 run 消费端不读）。
+    // 仅本终态路径（final 事件）产 done 帧时携带——aborted/yielded 分支的 done 帧不带（非 final
+    // 终态，无 final 权威 message 可透出；E1b thinking-only 形状走本路径，message 一并携带）。
+    out.push({
+      type: 'done',
+      runId,
+      ...(run.message !== undefined ? { message: run.message } : {}),
+      ...(structThinking !== null && !out.some((f) => f.type === 'text') ? { thinking: structThinking } : {}),
+    })
     // #560: 终态手动 sent.delete 删除——SDK 终态 identity 记入 acceptedFinalMessageIdentities
     //（规格 §2.3）。_sent 条目转冷条目，靠容量上限 + reset 兜底清理。
     return out

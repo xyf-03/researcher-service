@@ -5,10 +5,13 @@ import { createPinia, setActivePinia } from 'pinia'
 import { useAuthStore } from '@/stores/auth'
 import { createInstance, listInstances, removeInstance } from '@/api/containers'
 
-function mockResp(body: unknown, status = 200): Response {
+// 默认 application/json——后端 #312 信封响应经 res.json() 恒带该头；apiFetch 现按 Content-Type 决定
+// 是否做信封 sniff，mock 须建模真实响应头（否则非 JSON 200 会误走「跳过 sniff」分支）。
+function mockResp(body: unknown, status = 200, contentType = 'application/json'): Response {
   return {
     status,
     ok: status >= 200 && status < 300,
+    headers: { get: (k: string) => (k.toLowerCase() === 'content-type' ? contentType : null) },
     json: async () => body,
   } as unknown as Response
 }

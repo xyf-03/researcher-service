@@ -95,7 +95,7 @@ cd frontend  && npm run test && npm run build                    # vitest + vue-
 | `PORT` | `8001` | 控制面监听端口（REST + WS 同端口） |
 | `OPENCLAW_FLEET_ROOT` | `<cwd>/fleet` | `instances/<name>/` 落盘根（生产显式 pin 绝对路径） |
 | `OPENCLAW_TEMPLATE_DIR` | dev: `<repo>/researcher`（生产必设） | 共享只读 researcher 模板（预填充源）；**生产/Docker 部署必填**绝对路径（fail-fast） |
-| `OPENCLAW_IMAGE` | `ghcr.io/openclaw/openclaw:2026.7.1-browser` | 镜像 tag（官方 browser 变体，ADR 0003；生产建议 pin digest） |
+| `OPENCLAW_IMAGE` | `ghcr.io/acautomata/researcher-service/openclaw:latest` | 镜像 tag（派生镜像 issue #588：pdftotext + wiki/workspace 骨架，ADR 0013；可覆盖回官方基线） |
 | `LLM_API_KEY` | — | 全面板共享 LLM key（env 注入容器，不落盘） |
 | `PANEL_PUBLIC_ORIGIN` | `http://127.0.0.1:18789` | 面板对外 origin（隧道连网关 + 容器 allowedOrigins 强制条目）；**生产必填** |
 | `CREDENTIAL_ENCRYPTION_KEYS` | dev 固定密钥 | 凭证加密（gateway token 落盘密文）；**生产必填**逗号分隔 base64(32B) |

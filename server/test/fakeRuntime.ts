@@ -1,8 +1,8 @@
 // 假 docker runtime（接缝 #5：注入编排器测 5 态机 + 取消标志 + 端口入队前分配 + 补偿，不需真 daemon）。
 // 全内存模拟 ContainerRuntime：run/get/stop/remove/listFleet/hostPublishedPorts/exec 各原语可注入故障。
 
-import type { ContainerInfo, ContainerRuntime, ContainerSpec } from '../src/containers/runtime'
-import { containerName } from '../src/containers/runtime'
+import type { ContainerInfo, ContainerRuntime, ContainerSpec, NamedVolumes } from '../src/containers/runtime'
+import { containerName, volumeOrder } from '../src/containers/runtime'
 import { GATEWAY_INTERNAL_PORT, LABEL_INSTANCE_KEY, LABEL_PORT_KEY } from '../src/containers/constants'
 
 export interface FakeContainerRecord {
@@ -27,8 +27,19 @@ export class FakeRuntime implements ContainerRuntime {
   failExecSyncFor = new Set<string>()
   // execSync 调用记录（断言 delete 的 chown / approve 的 CLI argv）。
   execCalls: { name: string; cmd: string[] }[] = []
+  // #590：remove 收到 volumes 时的卷删除记录（断言 named volume 模式连带 docker volume rm 三卷）。
+  removedVolumes: string[] = []
 
   async run(spec: ContainerSpec): Promise<string> {
+    const id = await this.create(spec)
+    const rec = this.containers.get(spec.name)
+    if (rec) rec.info = { ...rec.info, running: true, status: 'running' }
+    return id
+  }
+
+  // #591：只创建不启动（createComplete 先 create → archive.writeConfig → start，静态 config）。
+  // 故障注入路径与 run 对齐（bind 冲突/非 bind 错/外部同名），status 'created'、running false。
+  async create(spec: ContainerSpec): Promise<string> {
     if (this.failRunFor.has(spec.name)) {
       throw new Error(`simulated docker run failure for ${spec.name}`)
     }
@@ -55,8 +66,8 @@ export class FakeRuntime implements ContainerRuntime {
     const info: ContainerInfo = {
       containerId: id,
       name: containerName(spec.name),
-      running: true,
-      status: 'running',
+      running: false,
+      status: 'created',
       image: spec.image,
       port: spec.hostPort,
       instanceName: spec.name,
@@ -87,13 +98,24 @@ export class FakeRuntime implements ContainerRuntime {
     if (r) r.info = { ...r.info, running: true, status: 'running' }
   }
 
+  // #591：按容器 id 启动（createComplete 用 create 返回的 id——消除 name 竞态）；id 不存在 no-op
+  async startById(containerId: string): Promise<void> {
+    for (const r of this.containers.values()) {
+      if (r.info.containerId === containerId) {
+        r.info = { ...r.info, running: true, status: 'running' }
+        return
+      }
+    }
+  }
+
   async stop(name: string): Promise<void> {
     const r = this.containers.get(name)
     if (r) r.info = { ...r.info, running: false, status: 'exited' }
   }
 
-  async remove(name: string): Promise<void> {
+  async remove(name: string, volumes?: NamedVolumes): Promise<void> {
     this.containers.delete(name)
+    if (volumes) this.removedVolumes.push(...volumeOrder(volumes))
   }
 
   async execInContainer(_name: string, _cmd: string[]): Promise<void> {}

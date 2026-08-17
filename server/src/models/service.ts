@@ -10,7 +10,7 @@
 // 级（容器门已挡），对外两者逐字节一致、区分仅进服务端日志。
 
 import type { Container, ModelProvider, PrismaClient } from '../generated/prisma/client'
-import { ConfigWriteError } from '../containers/configStore'
+import { ConfigWriteError } from '../containers/errors'
 import { fail, EnvelopeError } from '../envelope'
 import { CODE } from '../codes'
 import { type ProviderSpec } from './configBuilder'
@@ -243,9 +243,10 @@ export class ModelProviderService {
   }
 
   // #366 codex P2「事务内状态谓词」：路由层 resolveWrite 的 creating/removing 检查基于请求前快照，
-  // 与并发 DELETE（deleteReserve 标 removing → 后台 rmtree）无共享串行化——快照通过后状态可能已变。
+  // 与并发 DELETE（deleteReserve 标 removing → 后台清容器/目录）无共享串行化——快照通过后状态可能已变。
   // 这里在事务内重查行状态，把「removing 拒写」与 DB mutation 收进同一事务，消除 check-then-act
-  // TOCTOU：removing 期间放行写盘会与 rmtree 竞态 → ConfigStore 重建目录 → orphan 残留。
+  // TOCTOU：removing 期间放行写盘会与删容器竞态（#591 起写经 putArchive——容器已删则写失败、
+  // 未删则写落孤儿容器/目录）。
   // 行不存在（并发删完）与 creating/removing 同拒 20043。
   private async assertWritable(tx: ProviderTx, containerId: string): Promise<void> {
     const inst = await tx.container.findUnique({ where: { id: containerId } })
@@ -257,7 +258,7 @@ export class ModelProviderService {
   // #366 codex 四轮 P2「reconcile only failures known to occur after a successful rewrite」：
   // 仅「rewrite 成功落盘后事务才回滚」（P2028 交互事务超时 / commit 失败）需要 reconcile——fs 写盘
   // 不可取消、可能已落新配置，盘上领先 DB。P2002/P2025（mutation 抛错、rewrite 未执行）、
-  // ConfigWriteError（fs 真失败、盘未变）、CONTAINER_BUSY（谓词拒写）均盘=DB 一致，reconcile 是
+  // ConfigWriteError（putArchive 写失败、盘未变）、CONTAINER_BUSY（谓词拒写）均盘=DB 一致，reconcile 是
   // 多余写盘 → 跳过。多余写盘即 stale-write 竞态面：与并发的成功 mutation 交错会覆盖新配置
   // （withContainerLock 已把本恢复与正常写串行化，此处再收窄避免无谓的盘写入）。
   private needsReconcile(e: unknown): boolean {

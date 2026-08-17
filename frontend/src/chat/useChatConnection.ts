@@ -7,17 +7,20 @@ import { computed, ref } from 'vue'
 import { getBootstrapToken } from '@/api/chat'
 import { useAuthStore, isTokenExpired } from '@/stores/auth'
 import { useChatStore, newMsg, type Msg, type ApprovalItem, type ToolRow } from '@/stores/chat'
+import { useFileTabsStore } from '@/stores/fileTabs'
 import { ApiError } from '@/api/client'
 import {
   createGatewayChat,
+  createRequestId,
   type GatewayChat,
   type SessionDTO,
   type HistoryMessageDTO,
   type ChatFrame,
 } from '@/chat/gatewayChat'
 import { splitThinking } from '@/chat/thinking'
-import { extractMessageAttachments, extractMessageText, attachmentToMediaBlock, type MediaBlock } from '@/chat/eventTranslate'
+import { extractMessageAttachments, extractMessageText, extractThinking, attachmentToMediaBlock, type MediaBlock } from '@/chat/eventTranslate'
 import type { Attachment } from '@/chat/attachments'
+import { createOutboxStore } from '@/chat/outboxStore'
 import { WS_AUTH_FAIL, WS_MUST_CHANGE_PASSWORD, WS_CONTAINER_ACCESS_DENIED, WS_GATEWAY_UNAVAILABLE } from '@/chat/closeCodes'
 
 // T07 斜杠命令选项（ChatComposer 菜单渲染 props；单一来源计算在 useChatConnection）
@@ -45,7 +48,11 @@ const INITIAL_HISTORY_LIMIT = 50
 
 export function useChatConnection(status: ChatStatus) {
   const chat = useChatStore()
+  const fileTabs = useFileTabsStore()
   const auth = useAuthStore()
+  // #564: outbox 离线待发队列（sessionStorage 窄窗落盘）——「已点发送但网关还没回执」的消息
+  // 刷新/重连后自动重发。工厂默认取全局 sessionStorage；scope = 容器+会话。
+  const outbox = createOutboxStore()
 
   // 连接生命周期态（本属连接簇）：意外断线禁用发送、提示重连（codex P2 #4）；onReady/onClose 维护
   const disconnected = ref(false)
@@ -141,7 +148,10 @@ export function useChatConnection(status: ChatStatus) {
       // 未闭合 <thinking> 内容仍留思考（标签不泄露正文）。
       const parts = splitThinking(last.raw, { terminal: true })
       last.text = parts.text
-      last.thinking = parts.thinking
+      // #565: terminal 重解析只作用于内联 <thinking> 标签路；结构化 thinking 块（content[] 提取，
+      // handleText 以 ?? 覆盖写入）在 raw 无内联标签时被空内联结果冲掉（思考卡消失）——内联结果
+      // 非空仍覆盖（混合场景同源，方向差异无碍），为空保留结构化产物。
+      last.thinking = parts.thinking || last.thinking
     }
   }
 
@@ -216,7 +226,14 @@ export function useChatConnection(status: ChatStatus) {
   }
 
   // 增量文本：chat.delta 事件（deltaText 追加；replace 快照整段替换）。thinking 剥离纯函数无跨帧态。
-  function handleText(runId: string, delta: string, replace?: boolean) {
+  // #565: thinking?: string | null —— 结构化 thinking 块（replace 快照/final 的 content[]，翻译层
+  // 提取随帧携带）。合并规则按帧类型分：
+  //  - 带 thinking 字段的帧（replace 快照 / final tail-replace）：帧为权威——非 null 覆盖内联剥离
+  //    结果（结构化块权威，防双路拼接翻倍）、null 走内联路（该权威快照无结构化块）；
+  //  - delta 增量帧（thinking=undefined，增量是纯文本串无 content[]）：只更新内联路——内联结果
+  //    非空覆盖（<thinking> 标签增量），为空保留上一帧值（结构化思考跨帧存活，对齐内联标签靠
+  //    raw 累积跨帧存活的持久性——否则 replace 快照带的思考会被下一普通增量帧清空）。
+  function handleText(runId: string, delta: string, replace?: boolean, thinking?: string | null) {
     if (!claimRun(runId)) return
     const last = chat.messages[chat.messages.length - 1]
     // B5: 追加条件放宽到 activeRunId===runId（本 run 帧）——断线 onClose 已 finalizeLast 落定占位
@@ -228,7 +245,8 @@ export function useChatConnection(status: ChatStatus) {
       // 累积原始串 raw，再整体重解析拆出 thinking/text（replace 快照与 delta 追加统一走重解析）
       last.raw = replace ? delta : last.raw + delta
       const parts = splitThinking(last.raw)
-      last.thinking = parts.thinking
+      last.thinking =
+        thinking !== undefined ? (thinking ?? parts.thinking) : (parts.thinking || last.thinking)
       last.thinkingOpen = parts.inThinking
       last.text = parts.text
     }
@@ -247,17 +265,43 @@ export function useChatConnection(status: ChatStatus) {
     }
   }
 
-  function handleDone(runId: string) {
+  // #565: done 帧可携带 thinking——final 相等/thinking-only 场景（翻译层未产 text 帧）的结构化
+  // 思考经独立通道到达。写入时机 = finalizeLast 之前（terminal 重解析为空时经 || 保留该值；
+  // 非空时内联路终态结果优先，混合场景二者大概率同源，覆盖方向差异无视觉影响）。
+  // #569: message?: unknown —— 外来 run 可见 final 的权威消息本体（done 帧扩展携带，来源 #560
+  // currentRun.message）。仅 foreignRunIds 分支消费（局部插入）；本 run/abandoned/孤儿分支不读，
+  // 沿用既有终态逻辑。
+  function handleDone(runId: string, thinking?: string | null, message?: unknown) {
     if (abandonedRunIds.has(runId)) {
       abandonedRunIds.delete(runId)
       return
     }
     if (foreignRunIds.has(runId)) {
       foreignRunIds.delete(runId) // F7: 外来 run 终态：清理记录
+      // #569: 外来可见 final 局部插入 history（对齐官方 #1909，非整段重拉）——可见 final 的权威
+      // message 经 translateHistoryMessage 转 Msg 局部插入一条助手消息，不调 loadHistory（不打断
+      // 在途占位/滚动位置/historyGen 竞争）。「可见」= 提取后有实质内容（text/media/tools 非空）；
+      // 空 final（无内容）维持丢弃。去重 = 翻译层 #560 isReplayedFinal 重放网（同一外来 run 的
+      // final 二次到达不产 done 帧）+ 本分支终态清理的天然一次性（同一 runId 不会二次进入）。
+      // 不触碰 activeRunId/pendingSend/resumeRun——外来 final 与在途 turn 并存（纯追加一条）。
+      // 在途（activeRunId 非空，占位在尾部）时插到占位之前：「尾部 = 在途气泡」是 handleText/
+      // handleAttachment 续帧 append 的锚定不变量，外来消息尾部 push 会被后续续帧（activeRunId
+      // ===runId 放行 streaming=false）污染（B5 断线落定占位同理）；空闲/终态走尾部 push。
+      if (message) {
+        const msg = translateHistoryMessage(message as HistoryMessageDTO) // 薄适配：与历史消息同构
+        if (msg.text !== '' || msg.media.length > 0 || msg.tools.length > 0) {
+          if (activeRunId) chat.insertBeforeLast(msg)
+          else chat.pushMessage(msg)
+        }
+      }
       return
     }
     if (activeRunId && runId !== activeRunId) return
     if (activeRunId === runId) {
+      if (thinking !== undefined && thinking !== null) {
+        const last = chat.messages[chat.messages.length - 1]
+        if (last && last.role === 'assistant') last.thinking = thinking
+      }
       finalizeLast()
       activeRunId = ''
       clearResumeWait() // B5: run 正常终态，resume 无需继续
@@ -351,6 +395,7 @@ export function useChatConnection(status: ChatStatus) {
     const last = chat.messages[chat.messages.length - 1]
     if (!last || last.role !== 'assistant') return
     clearResumeWait() // B5: 本 run 工具续帧到达 → 取消 resume 超时重建
+    fileTabs.onToolEvent(tool) // #627 T2：drive 文件 tab（决议 A；自筛修改类 edit/write/apply_patch + 路径；历史不经此，决议 B）
     if (tool.state === 'running') {
       last.tools.push({ id: tool.id, name: tool.name, state: 'running', title: tool.title,
                         input: tool.input, result: tool.result })
@@ -416,7 +461,15 @@ export function useChatConnection(status: ChatStatus) {
       if (!chat.selectedSession) await newSession()
       if (gen !== containerGen) return // newSession 期间又切容器：不连
       if (!chat.selectedSession) return // 会话创建失败（newSession 已显示错误）：不加载历史
-      void loadHistory(chat.selectedSession) // T3：加载当前会话历史（C2：重连补拉也恢复投影）
+      // #564: 先 loadHistory 再重发 outbox 残留——历史铺底后乐观 echo 才排到正确位置，且内容级
+      // 去重（§三.3）可识别「网关已受理但 ack 丢」的历史消息（防 UI 双条）。await 保证 resendOutbox
+      // 看到的是历史铺底后的 messages（fire-and-forget 会让去重对比空列表、重发排在较新回复之后）。
+      // loadHistory 内部 try/catch 不会 reject（401/错误各自收尾），await 安全。
+      await loadHistory(chat.selectedSession)
+      // resendOutbox 前重查守卫：await 期间切容器/断线则跳过（不重发错容器；断线由下次重连触发）。
+      if (gen === containerGen && chat.selectedContainer === name && gateway && !disconnected.value) {
+        resendOutbox(name, chat.selectedSession)
+      }
       // B0: 补拉待处理审批（切页/断线期间网关 push 的 exec.approval.requested 收不到）——
       // 不补拉则 agent 卡在 exec 审批时前端无卡可回，agent 卡死被网关 stuck-session recovery
       // abort（生产实测）。chat.addApproval 幂等（按 id 去重），与实时 push 不冲突。
@@ -560,13 +613,13 @@ export function useChatConnection(status: ChatStatus) {
           if (gateway !== myGw) return
           switch (frame.type) {
             case 'text':
-              handleText(frame.runId, frame.delta, frame.replace)
+              handleText(frame.runId, frame.delta, frame.replace, frame.thinking)
               break
             case 'attachment': // #459-T3 #464：附件媒体帧（image/audio/video 块）
               handleAttachment(frame.runId, frame.media)
               break
             case 'done':
-              handleDone(frame.runId)
+              handleDone(frame.runId, frame.thinking, frame.message)
               break
             case 'error':
               handleError(frame.message, frame.runId)
@@ -736,6 +789,7 @@ export function useChatConnection(status: ChatStatus) {
     status.onConnecting(true)
     disconnected.value = false
     chat.resetForContainer()
+    fileTabs.reset() // #626 T1：切容器清文件 tab + workspace 树（下次进「文件」分段重拉）
     abandonActiveRun()
     clearPendingGraceTimer() // B4: 切容器清除旧容器武装的延迟收尾定时器（防跨容器 fire）
     clearResumeWait() // B5: 切容器放弃在途 run 的 resume 等待（新容器连接是新 run 语境）
@@ -787,10 +841,19 @@ export function useChatConnection(status: ChatStatus) {
     myRunId = '' // #53: 新 send 语境，ack runId 未知
     const myGw = gateway
     const sessionKey = chat.selectedSession
-    // chat.send RPC（幂等 key 在 gatewayChat 内生成）；网关拒绝（未配对/scope 不足）→ catch 收尾提示
+    const container = chat.selectedContainer
+    // #564: 幂等 key 在发送前生成并外注——ack 丢后的重发复用同一 id，经网关幂等去重防转录双跑。
+    // 入队时机 = gateway.send 调用前（与 pendingSend=true 同步点）：「在线但 ack 未回」窄窗落盘，
+    // ack 已回即删队（不打扰正常慢网关）。带附件消息不持久化（File/dataUrl 跨刷新失效，规格 §九）。
+    const id = createRequestId().replace(/[^a-z0-9]/g, '')
+    if (!hasAttachments) outbox.addPending(container, sessionKey, { id, text, createdAt: Date.now() })
+    // chat.send RPC（幂等 key 外注 #564）；网关拒绝（未配对/scope 不足）→ catch 收尾提示
     void myGw
-      .send(sessionKey, text, hasAttachments ? attachments : undefined)
+      .send(sessionKey, text, hasAttachments ? attachments : undefined, id)
       .then((runId) => {
+        // ack = 网关已受理（status:"started"）→ 确认送达，删队（无条件：ack 是权威；切容器后旧
+        // gateway 的 ack 也删旧容器队——消息已送达旧容器，留待无意义，且 scope 隔离互不影响）。
+        outbox.removePending(container, sessionKey, id)
         // #53: ack 返回本 run 的网关 runId（官方 chat.send ackPayload）——供首帧归属判别。
         // stale-gateway 守卫同 catch：切容器后旧 gateway 的 ack 不污染新 run 语境。
         if (gateway !== myGw || !pendingSend) return
@@ -807,7 +870,12 @@ export function useChatConnection(status: ChatStatus) {
         // 继续流式续帧。此时 finalize 占位会落定 streaming，续帧要么被当下次 send 的占位认领（跨 run
         // 文本污染 + 吞用户回复），要么占位永久卡。仅在「首帧未到即失败」（activeRunId 空，run 没起来）
         // 时 finalize + 清 pendingSend 放弃占位。
-        if (activeRunId) return
+        // #564: catch 按 activeRunId 细分删队——非空（网关已受理在续流）→ 删队（ack 慢而已）；空
+        //（run 未起来）→ 留队，下次重连/刷新经 resendOutbox 自动重发（规格 §三.2）。
+        if (activeRunId) {
+          outbox.removePending(container, sessionKey, id)
+          return
+        }
         // F3: RPC 失败复位 pendingSend——泄漏会让切会话变 phantom orphan（pendingAbandonCount++），
         // 下次发送首帧被当作孤儿丢弃、composer 永久锁死。
         pendingSend = false
@@ -816,6 +884,49 @@ export function useChatConnection(status: ChatStatus) {
       })
     chat.setInput('')
     return true
+  }
+
+  // #564: 重发 outbox 残留待发（刷新/断线重连统一触发点 = syncSessions 选定会话 + loadHistory 之后；
+  // 此时历史已铺底，乐观 echo 不会排到较新 assistant 回复之后）。逐条：
+  //  - 文本已在历史（网关已受理、ack 丢而已）→ remove 不重发（内容级去重防 UI 双条，规格 §三.3）；
+  //  - 否则按 send() 同款乐观 echo + gateway.send(sessionKey, text, undefined, item.id)——复用原
+  //    幂等 key（网关幂等去重防转录双跑）；ack 后 remove，失败留队下次再试（取走不删，重发不经宿主，
+  //    纯文本无附件，天然不碰附件预览条）。
+  async function resendOutbox(container: string, sessionKey: string) {
+    const items = outbox.takePending(container, sessionKey)
+    if (!items.length || !gateway || disconnected.value) return
+    const myGw = gateway
+    // 内容级去重（规格 §三.3）：取历史中 user 消息文本全集。历史侧无 createdAt 可比（Msg 不产
+    // 该字段），故只按 text 匹配——同文本歧义（两条同文本只受理一条/loadHistory 保留的本地在途
+    // 消息同文本）为 content-level 最小版的固有取舍：误删不会让消息「从 UI 消失」（同文本在渲染
+    // 中可见），误重发由网关幂等去重兜底，两端都可接受。
+    const inHistory = new Set(chat.messages.filter((m) => m.role === 'user').map((m) => m.text))
+    for (const item of items) {
+      if (inHistory.has(item.text)) {
+        outbox.removePending(container, sessionKey, item.id) // 已送达历史：确认点达成
+        continue
+      }
+      if (gateway !== myGw || disconnected.value) return // 中途断开/切走：剩余留待下次
+      chat.pushMessage(newMsg('user', item.text))
+      chat.pushMessage(newMsg('assistant'))
+      activeRunId = '' // 与 send() 同款：等首帧锚定新 run
+      pendingSend = true
+      myRunId = '' // #53: 重发是新 send 语境，ack runId 未知
+      void myGw
+        .send(sessionKey, item.text, undefined, item.id)
+        .then(() => outbox.removePending(container, sessionKey, item.id))
+        .catch(() => {
+          if (gateway !== myGw) return // 切走：旧容器消息留待下次进容器重发
+          // 与 send() 同款 catch 细分（规格 §三.2）：activeRunId 非空 = 重发已受理在续流 → 删队
+          //（ack 慢而已）；空 = run 未起来 → 留队，下次重连再试（幂等 key + 内容去重兜底不双跑）。
+          if (activeRunId) {
+            outbox.removePending(container, sessionKey, item.id)
+            return
+          }
+          pendingSend = false
+          finalizeLast() // 未受理：落定占位（composer 解锁），留队下次重连再试
+        })
+    }
   }
 
   // 统一发送入口（#459-T2 #463 #1）：宿主提供 onSend（含附件校验/清空预览条）则走它（Enter/斜杠/
@@ -864,6 +975,7 @@ export function useChatConnection(status: ChatStatus) {
     const hgen = ++historyGen // codex #249 P2：本请求代；之后再有 loadHistory 即取代本请求
     if (!gateway) return // E2: 断线不重载（防先清空 transcript 再 RPC 失败留白）
     chat.resetForSession()
+    fileTabs.closeAll() // #626 T1：切会话清文件 tab（workspace 树是 per-container，保留）
     chat.setHistoryLoading(true)
     status.onClearError()
     try {
@@ -873,6 +985,10 @@ export function useChatConnection(status: ChatStatus) {
       // codex P2 #108：保留 await 期间 send() 追加的进行中 turn（user + 流式 assistant 占位）。
       // 直接整体替换会被历史快照覆盖 → delta 找不到 streaming 尾，整轮实时回复从 UI 消失。
       const inFlight = chat.messages
+      // TODO(ii) 消息级 __openclaw.seq 排序：当前按到达序拼接（history + inFlight），不按 seq。
+      // 暂缓——#560 §3 判不可行（历史/本地消息拿不到可靠 seq）+ 本地无网关无法实测；
+      // 前置票：乐观消息接入 projection 元数据 + 真网关抓包确认流式 seq 下发。详见 memory
+      // message-seq-ordering-deferred。
       chat.setMessages([...res.messages.map(translateHistoryMessage), ...inFlight])
       chat.setHistoryState(res.hasMore, res.nextOffset, false)
     } catch (e) {
@@ -886,7 +1002,11 @@ export function useChatConnection(status: ChatStatus) {
 
   // T3 历史消息翻译（防腐层，issue #82）：网关 display-normalized 消息字段名「待实测」（对齐后端
   // _parse_history 透传策略），前端单点容错——role 归一 operator/user/human→user、其余→assistant；
-  // text 主取 text、回退 content/message。历史消息为终态：streaming=false、无 tools、thinking 暂不剥离。
+  // text 主取 text、回退 content/message。历史消息为终态：streaming=false；tools 无条件提取
+  //（Q2-1(a)，与流式路一致——流式工具挂 msg.tools，历史也提取 toolCall 块进 tools）。
+  // #565: 结构化 thinking 块（content[] 的 type==='thinking' 块）经 extractThinking 提取填
+  // Msg.thinking（history 全量覆盖）；内联 <thinking> 标签剥离（splitThinking 的残片/未闭合
+  // 语义）属流式路，历史为终态不剥离（既有现状：旧格式历史正文含字面标签，本规格不动）。
   // E1b: toolCall-only assistant 消息（生产实测：exec 审批无人处理 → 网关 stuck-session recovery
   // abort run → 最后一条 assistant content=[thinking,toolCall×N] 无 text 块）→ 提取 text 为空，
   // 若照原样渲染成空文本气泡（用户误以为回复丢失）。转译 toolCall 块为工具行（done 态）——
@@ -896,15 +1016,21 @@ export function useChatConnection(status: ChatStatus) {
     // ADR 0003）——复用 eventTranslate.extractMessageText（已处理 string/数组 content 并跳过
     // thinking 块），不再只认 string 导致 assistant 历史渲染成空泡。text 字段回退保留（旧透传 shape）。
     const text = extractMessageText(m) || (typeof m.text === 'string' ? m.text : '')
-    const tools = text === '' ? extractToolRows(m) : []
+    // Q2-1(a)：无条件提取 toolCall 块——与流式路一致（流式工具挂 msg.tools），消除「正文+工具」
+    // 消息刷新后工具行凭空消失的布局分歧。原 text==='' 门（仅 toolCall-only 消息留工具）与流式
+    // 不对称：有正文即丢全部工具，刷新后工具整段消失。
+    const tools = extractToolRows(m)
     // #459-T3 #464：历史消息 image/audio/video 块 → media（与 text 独立通道，extractToolRows 同款
     // 防腐层位置）。此前非 text 块被渲染层丢弃；纯图片历史消息（text 空 + media 非空）照常渲染。
     const media = extractMessageAttachments(m)
+    // #565: 结构化 thinking 块提取——与 text 独立通道（thinking 块不混入正文，正文块不混入思考）；
+    // null（无结构化块）回退 ''（现状：无思考卡），非 null 填折叠卡渲染。
+    const structThinking = extractThinking(m)
     return {
       role: historyRole(m.role),
       raw: text,
       text,
-      thinking: '',
+      thinking: structThinking ?? '',
       thinkingOpen: false,
       streaming: false,
       tools,
@@ -912,8 +1038,8 @@ export function useChatConnection(status: ChatStatus) {
     }
   }
 
-  // E1b: 从 assistant 消息 content 提取 toolCall 块 → 工具行（done 态）。仅当正文为空时调用
-  //（有正文则工具行为噪音）。toolCall 块字段：type/toolCallId/name/arguments（实测 jsonl）。
+  // 从 assistant 消息 content 提取 toolCall 块 → 工具行（done 态）。Q2-1(a)：无条件调用（与流式
+  // 路一致），有正文也提取——消除刷新后工具消失。toolCall 块字段：type/toolCallId/name/arguments（实测 jsonl）。
   function extractToolRows(m: HistoryMessageDTO): ToolRow[] {
     const content = (m as { content?: unknown }).content
     if (!Array.isArray(content)) return []
@@ -1010,6 +1136,7 @@ export function useChatConnection(status: ChatStatus) {
     if (chat.selectedSession === key) {
       chat.setSelectedSession('')
       chat.resetForSession() // 清空消息投影 → 空聊天区（不再自动切到剩余首个或新建）
+      fileTabs.closeAll() // #626 T1：删当前会话=离开会话，清文件 tab（workspace 树保留）
       status.onClearError() // 删除当前会话后清残留错误条（spec #461：错误呈现统一走 toast，不留双通道）
     }
     return true

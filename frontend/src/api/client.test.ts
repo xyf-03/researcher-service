@@ -5,10 +5,14 @@ import { createPinia, setActivePinia } from 'pinia'
 import { useAuthStore } from '@/stores/auth'
 import { apiFetch, apiJson, ApiError } from '@/api/client'
 
-function mockResp(body: unknown, status = 200): Response {
+// 默认 application/json（后端信封响应经 res.json() 恒带该头）；非 JSON 场景（二进制 PNG 等）
+// 传第三个参数覆盖。apiFetch 现在对 HTTP 200 按 Content-Type 决定是否做信封 sniff——mock 须建模
+// 真实响应头，否则 JSON 信封测试会误走「非 JSON → 跳过 sniff」分支。
+function mockResp(body: unknown, status = 200, contentType = 'application/json'): Response {
   return {
     status,
     ok: status >= 200 && status < 300,
+    headers: { get: (k: string) => (k.toLowerCase() === 'content-type' ? contentType : null) },
     json: async () => body,
   } as unknown as Response
 }
@@ -225,6 +229,21 @@ describe('api client', () => {
   // PR #370 第四轮 R4-3（P0）：10005（mustChangePassword）是授权门状态，非凭据失效——刷新换新 token
   // 不会改变它。不得放入 ENVELOPE_UNAUTHENTICATED_CODES 触发刷新链（否则改密用户每请求都无谓刷新
   // 再抛 401「未登录」，看不到「需改密」指引）。apiFetch 对 10005 应直接返回响应交 apiJson 抛 code。
+  // T09 Spec-1（PNG 二进制 body 守卫）：HTTP 200 + 非 JSON（image/png 原生字节）→ apiFetch 不得
+  // 调 json()/读 body（否则 drain 流使 blob() 抛 Body is unusable），须原样返回。
+  it('apiFetch returns non-JSON 200 without reading/consuming the body', async () => {
+    const jsonSpy = vi.fn()
+    ;(globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+      status: 200,
+      ok: true,
+      headers: { get: (k: string) => (k.toLowerCase() === 'content-type' ? 'image/png' : null) },
+      json: jsonSpy,
+    } as unknown as Response)
+    const resp = await apiFetch('/api/v1/figures/f-1/png')
+    expect(resp.status).toBe(200)
+    expect(jsonSpy).not.toHaveBeenCalled() // 非 JSON 200：绝不读 body
+  })
+
   it('apiFetch does not trigger refresh chain on envelope 10005（mustChangePassword 非凭据失效）', async () => {
     const auth = useAuthStore()
     auth.token = 't'

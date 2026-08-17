@@ -1,5 +1,5 @@
 // #371-5 门控集成 smoke（真网关配对闭环实测，issue #378）。
-// 在真容器网关（ghcr.io/openclaw/openclaw:2026.7.1-browser）上验证 ADR 0006 遗留实测项①：
+// 在真容器网关（默认官方基线，见下方 IMAGE；派生镜像内容与配对协议无关）上验证 ADR 0006 遗留实测项①：
 // 浏览器无 token + bootstrap 首连 → 网关 PAIRING_REQUIRED{requestId} → 后端 approve（容器内
 // docker exec `openclaw devices approve`）→ 重连 → hello-ok 下发 deviceToken → 后续连接用
 // deviceToken 直接通（无再次配对）。
@@ -32,7 +32,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import http, { type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import path from 'node:path'
 import { generateKeyPairSync, createHash, sign as ed25519Sign } from 'node:crypto'
@@ -50,6 +50,7 @@ import { seedUser, login, bearer } from './helpers'
 import { FleetDeps } from '../src/containers/deps'
 import { Orchestrator } from '../src/containers/orchestrator'
 import { DockerRuntime } from '../src/containers/dockerRuntime'
+import { DockerFileArchive } from '../src/files/dockerArchive'
 import { containerName } from '../src/containers/runtime'
 import { InlineLifecycleQueue } from '../src/containers/lifecycleQueue'
 import { defaultReservedPorts, type FleetConfig } from '../src/containers/values'
@@ -59,13 +60,15 @@ import { makeWsGatewayConnector } from '../src/chat/gatewayConnector'
 import { DEV_ENCRYPTION_KEYS } from '../src/crypto'
 import { ensureImageAvailable } from './smokeDocker'
 
-// ---- 镜像 / 容器参数（对齐 containers-smoke）----
+// ---- 镜像 / 容器参数（对齐 containers-smoke：默认官方基线——编排与镜像内容无关，
+// 避免私有派生 GHCR tag 的本地前置；派生镜像由 config OPENCLAW_IMAGE 注入 + 静态断言兜底）----
 const IMAGE = process.env.OPENCLAW_IMAGE ?? 'ghcr.io/openclaw/openclaw:2026.7.1-browser'
 const BOX = 'pairing-smoke'
 
-// Docker Desktop（macOS）只对 /Users 下路径 bind mount 生效——/tmp、/var/folders 挂进容器静默为空
-//（网关读不到 home/config → openclaw exit 78「Missing config」）。临时 fleetRoot 放 worktree 内
-//（.gitignore 忽略 .smoke-tmp/），容器才能读到 home/config（实测校准，用户指示「临时挂 worktree 下」）。
+// 临时 fleetRoot 放 worktree 下（.gitignore 忽略 .smoke-tmp/）。旧 bind 时代容器经宿主路径挂载
+// home/config、Docker Desktop（macOS）只对 /Users 下路径 bind mount 生效（实测校准）；#592 起
+// 默认 named volume 拓扑、config 经 putArchive 落容器内，宿主路径不再挂进容器——布局保留仅作
+// 模板目录/openclaw.json 渲染源的宿主位置（控制面自己读，无 Docker 挂载约束）。
 const SMOKE_ROOT = path.join(path.resolve(process.cwd(), '..'), '.smoke-tmp')
 
 // ---- 浏览器侧协议机 transport（Node 版，与 frontend/src/chat/tunnelSocket.ts 同构）----
@@ -240,13 +243,16 @@ describe('真网关配对闭环 smoke（#371-5 / #378）', () => {
       publishHost: '127.0.0.1',
       healthHost: '127.0.0.1',
       panelOrigin: 'http://127.0.0.1:18789', // 与容器 allowedOrigins 默认 seed 一致（配对 smoke 直连真网关）
+      namedVolumes: true, // #592 本地/CI 默认 named volume 拓扑（config 经 putArchive 落容器内、穿卷读）
       reservedPorts: defaultReservedPorts(),
       encryptionKeys: DEV_ENCRYPTION_KEYS,
     }
     runtime = new DockerRuntime(undefined, cfg.publishHost)
     // 残留容器兜底（上次失败 may 残留 unless-stopped 容器 → docker run name 冲突）：先清再建。
     await runtime.remove(BOX).catch(() => {})
-    const deps = new FleetDeps(runtime, cfg, { queue: new InlineLifecycleQueue() })
+    // #591：config 写读经 FileArchive（createComplete 落容器内 openclaw.json；此处读容器内验证）
+    const archive = new DockerFileArchive()
+    const deps = new FleetDeps(runtime, cfg, { queue: new InlineLifecycleQueue(), archive })
     orch = new Orchestrator(deps, ctx.prisma)
     // 挂载 containers 路由（bootstrap-token / approve 走真实 HTTP + 真 docker exec）。
     const app = createApp({ prisma: ctx.prisma, orchestrator: orch, runtime })
@@ -263,12 +269,12 @@ describe('真网关配对闭环 smoke（#371-5 / #378）', () => {
     containerPort = created.port
     expect(created.status).toBe('running')
 
-    // #386 生产形态证明：容器 openclaw.json（宿主 instances/<id>/config/openclaw.json，ro bind 进
-    // 容器）的 gateway.controlUi.allowedOrigins 须含配置 panelOrigin——ConfigRenderer 强制点
-    //（#385），隧道连网关的 Origin header 与容器允许列表同源闭环。
-    const containerConfig = JSON.parse(
-      readFileSync(path.join(cfg.root, 'instances', created.id, 'config', 'openclaw.json'), 'utf8'),
-    ) as { gateway?: { controlUi?: { allowedOrigins?: string[] } } }
+    // #386 生产形态证明：容器内 openclaw.json（#591 起经 putArchive 落 ~/.openclaw/openclaw.json，
+    // 不再落宿主 instances/<id>/config）的 gateway.controlUi.allowedOrigins 须含配置 panelOrigin——
+    // ConfigRenderer 强制点（#385），隧道连网关的 Origin header 与容器允许列表同源闭环。
+    const containerConfig = JSON.parse(await archive.readConfig(BOX)) as {
+      gateway?: { controlUi?: { allowedOrigins?: string[] } }
+    }
     expect(containerConfig.gateway?.controlUi?.allowedOrigins).toContain(cfg.panelOrigin)
 
     // 端口映射实况检查（CI 定位 #378）：daemon 侧 NetworkSettings.Ports 若为空（{}），docker-proxy

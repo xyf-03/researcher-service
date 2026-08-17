@@ -124,6 +124,13 @@ export const useChatStore = defineStore('chat', {
     pushMessage(m: Msg): void {
       this.messages.push(m)
     },
+    // #569: 外来可见 final 插入（在途时）——插到当前最后一条（在途气泡/占位）之前。「尾部 =
+    // 在途气泡」是 handleText/handleAttachment 续帧 append 的锚定不变量：外来消息若尾部 push，
+    // 后续续帧（activeRunId===runId 放行 streaming=false）会污染外来消息。调用方保证
+    // activeRunId 非空时最后一条为在途气泡；空闲/终态路径走 pushMessage（尾部追加）。
+    insertBeforeLast(m: Msg): void {
+      this.messages.splice(this.messages.length - 1, 0, m)
+    },
     setMessages(list: Msg[]): void {
       this.messages = list
     },

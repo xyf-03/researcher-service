@@ -1,7 +1,8 @@
 // ProviderConfigBuilder —— openclaw.json models.providers 合并纯逻辑（平移 backend/models/config_builder.py，#336）。
 //
 // 纯领域逻辑（无 IO / 无 Prisma）：消费 ProviderSpec 列表，把 DB model provider 合并进
-// base openclaw.json cfg，供 ModelConfigWriter 写盘经 OpenClaw watch 热加载生效。
+// base openclaw.json cfg，供 ModelConfigWriter 经 FileArchive.putArchive 写容器内
+//（#591 静态 config：写盘后重启容器生效，OpenClaw 加载时校验形状）。
 //
 // 规则（r28）：
 // - 空 providers → base 透传（P0 兼容：无托管 provider 时沿用模板默认 minimax）。

@@ -1,100 +1,12 @@
 // WikiService 聚合逻辑单测（#335 · 对 fake WikiFileSystem 直测，不碰磁盘/DB）。
 // 契约锚点 = backend/wiki/tests/test_service_fake_fs.py + test_graph_api.py + test_categories_api.py。
 // 验证：CRUD 域错误映射、listCategories 分组/排序/窗口、buildGraph 节点/边/ghost/不 dedup。
+// fake 自 #621 起共享于 ./fakes（REST 契约测试 wiki.test.ts 同用）。
 
 import { describe, it, expect } from 'vitest'
-import { FrontmatterParser, frontmatterTitle } from '../src/wiki/logic'
-import { SKIP_DIRS, SKIP_FILES } from '../src/wiki/values'
 import { WikiInvalidPath, WikiPageExists, WikiPageNotFound } from '../src/wiki/errors'
 import { WikiService } from '../src/wiki/service'
-import type { WikiCategoryPage, WikiFileSystem, WikiTree, WikiTreeGroup, WikiTreePage } from '../src/wiki/fsPort'
-
-// 内存 fake Port（对齐 backend/integration/openclaw/fakes.py FakeWikiFileSystem）：
-// 页面 dict → build_tree 按顶层目录分组；CRUD 语义与越权防护对齐 NodeWikiFileSystem。
-class FakeWikiFileSystem implements WikiFileSystem {
-  pages = new Map<string, string>()
-
-  constructor(entries: Record<string, string>) {
-    for (const [k, v] of Object.entries(entries)) this.pages.set(k, v)
-  }
-
-  private validatePath(relPath: string): void {
-    const parts = relPath.split('/').filter(Boolean)
-    if (parts.some((p) => p === '..')) throw new WikiInvalidPath(relPath)
-    if (parts.some((p) => SKIP_DIRS.has(p))) throw new WikiInvalidPath(relPath)
-    if (parts.length && SKIP_FILES.has(parts[parts.length - 1])) throw new WikiInvalidPath(relPath)
-  }
-
-  private titleOf(content: string, stem: string): string {
-    const p = new FrontmatterParser()
-    const { frontmatter, body } = p.parse(content)
-    return frontmatterTitle(frontmatter) ?? this.h1Title(body) ?? stem
-  }
-
-  private h1Title(body: string): string | null {
-    for (const line of body.split('\n')) {
-      if (line.startsWith('# ')) {
-        const t = line.slice(2).trim()
-        return t || null
-      }
-    }
-    return null
-  }
-
-  async buildTree(): Promise<WikiTree> {
-    const groups = new Map<string, WikiTreeGroup>()
-    for (const rel of [...this.pages.keys()].sort()) {
-      const slash = rel.indexOf('/')
-      if (slash < 0) continue // 顶层散落页不收（categories 才收）
-      const top = rel.slice(0, slash)
-      if (SKIP_DIRS.has(top)) continue
-      if (SKIP_FILES.has(rel.slice(rel.lastIndexOf('/') + 1))) continue
-      const stem = rel.slice(rel.lastIndexOf('/') + 1, -3)
-      const item: WikiTreePage = { path: rel, title: this.titleOf(this.pages.get(rel)!, stem) }
-      if (!groups.has(top)) groups.set(top, { kind: top, name: top, pages: [] })
-      groups.get(top)!.pages.push(item)
-    }
-    return { groups: [...groups.values()].map((g) => ({ kind: g.kind, name: g.name, pages: g.pages })) }
-  }
-
-  async readPage(relPath: string): Promise<{ path: string; title: string; content: string }> {
-    this.validatePath(relPath)
-    const content = this.pages.get(relPath)
-    if (content === undefined) throw new WikiPageNotFound(relPath)
-    const stem = relPath.slice(relPath.lastIndexOf('/') + 1, -3)
-    return { path: relPath, title: this.titleOf(content, stem), content }
-  }
-
-  async listCategoryPages(): Promise<WikiCategoryPage[]> {
-    const out: WikiCategoryPage[] = []
-    for (const [rel, content] of this.pages) {
-      this.validatePath(rel)
-      const stem = rel.slice(rel.lastIndexOf('/') + 1, -3)
-      out.push({ path: rel, title: this.titleOf(content, stem), content })
-    }
-    return out
-  }
-
-  async writePage(relPath: string, content: string): Promise<{ path: string }> {
-    this.validatePath(relPath)
-    if (!this.pages.has(relPath)) throw new WikiPageNotFound(relPath)
-    this.pages.set(relPath, content)
-    return { path: relPath }
-  }
-
-  async createPage(relPath: string, content: string): Promise<{ path: string }> {
-    this.validatePath(relPath)
-    if (this.pages.has(relPath)) throw new WikiPageExists(relPath)
-    this.pages.set(relPath, content)
-    return { path: relPath }
-  }
-
-  async deletePage(relPath: string): Promise<void> {
-    this.validatePath(relPath)
-    if (!this.pages.has(relPath)) throw new WikiPageNotFound(relPath)
-    this.pages.delete(relPath)
-  }
-}
+import { FakeWikiFileSystem } from './fakes'
 
 function fixtureFs(): FakeWikiFileSystem {
   return new FakeWikiFileSystem({

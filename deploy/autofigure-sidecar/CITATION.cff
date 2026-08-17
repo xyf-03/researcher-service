@@ -1,0 +1,51 @@
+cff-version: 1.2.0
+message: "If AutoFigure materially helped your research or published figures, please cite the AutoFigure paper."
+title: "AutoFigure"
+type: software
+license: MIT
+repository-code: "https://github.com/ResearAI/AutoFigure"
+url: "https://github.com/ResearAI/AutoFigure"
+authors:
+  - family-names: Zhu
+    given-names: Minjun
+  - family-names: Lin
+    given-names: Zhen
+  - family-names: Weng
+    given-names: Yixuan
+  - family-names: Lu
+    given-names: Panzhong
+  - family-names: Xie
+    given-names: Qiujie
+  - family-names: Wei
+    given-names: Yifan
+  - family-names: Liu
+    given-names: Sifan
+  - family-names: Sun
+    given-names: Qiyao
+  - family-names: Zhang
+    given-names: Yue
+preferred-citation:
+  type: paper-conference
+  title: "AutoFigure: Generating and Refining Publication-Ready Scientific Illustrations"
+  authors:
+    - family-names: Zhu
+      given-names: Minjun
+    - family-names: Lin
+      given-names: Zhen
+    - family-names: Weng
+      given-names: Yixuan
+    - family-names: Lu
+      given-names: Panzhong
+    - family-names: Xie
+      given-names: Qiujie
+    - family-names: Wei
+      given-names: Yifan
+    - family-names: Liu
+      given-names: Sifan
+    - family-names: Sun
+      given-names: Qiyao
+    - family-names: Zhang
+      given-names: Yue
+  year: 2026
+  booktitle: "The Fourteenth International Conference on Learning Representations"
+  url: "https://openreview.net/forum?id=5N3z9JQJKq"

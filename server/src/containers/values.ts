@@ -23,6 +23,9 @@ export interface FleetConfig {
   readonly healthHost: string // 健康探测目标 host（与 WS 配对同源）
   // 面板对外 origin（#385）：隧道连网关的 WS Origin + 容器 allowedOrigins 强制条目（生产必填）
   readonly panelOrigin: string
+  // #590/#592 named volume 拓扑开关（ADR 0011；OPENCLAW_NAMED_VOLUMES）：true（默认）时编排用
+  // openclaw-wiki/workspace/home-<id> 三卷替代宿主 bind-mount home；显式 false 回退旧 bind
+  readonly namedVolumes: boolean
   readonly reservedPorts: ReadonlySet<number> // 强制保留（默认含 18789）
   // 凭证加密密钥（AES-256-GCM；gateway token 真值不落盘，首个 active 加密、余仅解密供轮换）
   readonly encryptionKeys: readonly Buffer[]

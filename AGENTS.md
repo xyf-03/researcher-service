@@ -27,7 +27,7 @@ cd server
 npm install
 npm run prisma:generate                        # 生成 Prisma client（fresh checkout 必须）
 npm run db:apply                               # 落表（better-sqlite3 直连 prisma/init.sql）
-npm run dev                                    # tsx watch，http://localhost:8001（REST + WS 同端口）
+npm run dev                                    # tsx watch 宿主直跑（仅纯逻辑调试——摸不到 named volume；起服务/真编排走下方容器化 dev 栈）
 npm run typecheck                              # tsc --noEmit
 npm test                                       # vitest 全量（containers-smoke 需真 docker daemon）
 npm run build                                  # tsc + prisma generate 产物拷贝
@@ -35,9 +35,15 @@ npm run build                                  # tsc + prisma generate 产物拷
 # ---- frontend（Vue3 + Vite）----
 cd frontend
 npm install
-npm run dev                                    # Vite dev server（proxy /api、/ws → :8001）
+npm run dev                                    # Vite dev server（proxy /api、/ws → :8001，指向容器化 server）
 npm run test                                   # vitest
 npm run build                                  # vue-tsc 类型检查 + vite build
+
+# ---- dev 控制面（容器化，与 prod 同形态；issue #594 / ADR 0013）----
+# 起服务 / 真编排 OpenClaw 容器（named volume 拓扑）一律走此；纯逻辑迭代仍用上方宿主 npm test/typecheck。
+docker compose -f deploy/docker-compose.dev.yml up -d --build   # server+redis，挂 docker.sock，server:8001
+# 前置：researcher 克隆到仓库根（build context template=../researcher，或设 RESEARCHER_DIR）；
+#       真编排另需派生镜像（docker build deploy/openclaw-image）+ export LLM_API_KEY。详见 deploy/README.md。
 ```
 
 ## 架构总览
@@ -63,8 +69,9 @@ OpenClaw 容器 fleet (openclaw-gw-<name>，每容器独立 home/openclaw.json/�
 | `auth/` | 双角色账号 + JWT 签发/刷新（R1 旋转）+ bootstrap B1 + C1 强制改密 | `tokens.ts` `authenticate.ts` `bootstrap.ts` `userService.ts` |
 | `containers/` | Docker SDK 编排（增/删/查容器、端口池、config 渲染、5 态机） | `orchestrator.ts` `dockerRuntime.ts` `ports.ts` `configRenderer.ts` `fleetAssembly.ts` |
 | `wiki/` | 每容器 `wiki/main` 文件树 + CRUD + graph（`WikiFileSystem` Port + 纯逻辑） | `service.ts` `logic.ts` `nodeFs.ts` `compile.ts` `routes.ts` |
-| `models/` | 每容器 model provider CRUD + 热加载 + 写盘回滚 | `configWriter.ts` `routes.ts` |
+| `models/` | 每容器 model provider CRUD + 静态 config 写盘（putArchive 落容器内，改配置重启生效）+ 写盘回滚 | `configWriter.ts` `routes.ts` |
 | `chat/` | 网关隧道（JWT 握手 4401 + 原始帧透传，ADR 0006 浏览器直连） | `tunnelAssembly.ts` `subprotocol.ts` `values.ts` |
+| `files/` | 统一文件 CRUD（wiki/workspace 两树，经 Docker getArchive/putArchive/exec rm，ADR 0012） | `fsPort.ts` `dockerArchive.ts` `paths.ts` `tar.ts` `routes.ts` |
 
 配置集中在 `src/config.ts`（env 读取 + 生产 fail-fast）。Prisma schema 在 `prisma/schema.prisma`
 （建表 SQL 由 `scripts/apply-schema.mjs` 落库，不经 prisma CLI——规避 Prisma 7 AI 守卫）。
@@ -78,12 +85,19 @@ OpenClaw 容器 fleet (openclaw-gw-<name>，每容器独立 home/openclaw.json/�
 - `/api/v1/containers/<name>/pairing/` — 设备配对查询/触发/approve。
 - `/api/v1/containers/<name>/wiki/{tree,page,graph,categories}` — wiki 文件树/读写/图谱。
 - `/api/v1/containers/<name>/models/providers[/<pid>]` — model provider CRUD。
+- `/api/v1/containers/<name>/files?root=<wiki|workspace>&path=&recursive=` — 统一文件 CRUD
+  （GET 列目录/读文件 + PUT/POST 覆写/新建 + DELETE 删除；binary/oversized 不返回内容）。
 - `/api/v1/containers/<name>/chat/{sessions,approval/resolve,commands}` — chat REST 代理。
 - 对话 WS 走 `/ws/chat/` 隧道（JWT subprotocol 握手；先 accept 再 close(4401) 拒未认证）。
 
 全局 #312 信封：所有 REST 一律 HTTP 200，错误信号在 body `{code,message,data}`；「不存在 vs 越权」
-同码防探测（20040/30040/40040）。码段：`0` 成功 · `1xxxx` 通用/鉴权 · `2xxxx` 容器 · `3xxxx` wiki ·
-`4xxxx` models · `5xxxx` chat/pairing · `9xxxx` 系统/校验。
+同码防探测（20040/30040/40040/60040）。例外：二进制成功路径直发原生字节（`GET /figures/:id/png` 成功
+返 `image/png` 字节，不包信封、不 base64-in-JSON；错误面仍走信封）。码段：`0` 成功 · `1xxxx` 通用/鉴权 ·
+`2xxxx` 容器 · `3xxxx` wiki ·
+`4xxxx` models · `5xxxx` chat/pairing（非信封段，错误经 WS close codes）· `6xxxx` files ·
+`7xxxx` figures（AutoFigure，70040 不存在/越权同码防探测（T05 读路径，PNG 复用同一归属门）· 70041 幂等冲突 ·
+70042 PNG 未就绪（queued/running）· 70043 PNG 不可用（failed/产物缺失））·
+`9xxxx` 系统/校验。
 
 ## frontend 结构（`frontend/src/`）
 

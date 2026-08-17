@@ -42,6 +42,15 @@ export const routes: RouteRecordRaw[] = [
     component: () => import('@/views/ModelView.vue'),
     meta: { requiresAuth: true },
   },
+  // AutoFigure（T09，docs/autofigure/tickets/T09-vue-figure-journey.md）：常规受保护路由，
+  // 不随 capability 门控——flag off 时直达由 AutoFigureView 呈现「功能未启用」（非裸 404），
+  // 与 admin nav（meta.requiresAdmin 守卫兜底）同理：nav 入口隐藏只是 UI，路由守卫不负责 flag。
+  {
+    path: '/figures',
+    name: 'figures',
+    component: () => import('@/views/AutoFigureView.vue'),
+    meta: { requiresAuth: true },
+  },
   // #328：顶层路由（无 /admin 嵌套壳）；meta.requiresAdmin 首例——非 admin 重定向 /
   {
     path: '/admin/users',

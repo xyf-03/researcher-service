@@ -56,6 +56,14 @@ export const containerCreateSchema = z.object({
     .regex(CONTAINER_NAME_REGEX, 'name 须以小写字母开头，3–30 位，仅含小写字母、数字、连字符'),
 })
 
+// AutoFigure（T01，docs/autofigure/tickets/T01-authenticated-figure-creation.md）：
+// Figure 创建请求体。仅 prompt 一项；ownerId 不接收——zod object 默认 strip 未知字段，客户端
+// 随请求提交的 userId（若有）被丢弃，绝不作为归属来源（ownerId 只来自认证身份，见 figures/routes.ts）。
+// trim 对齐 modelProviderWriteSchema.base_url 先例（纯空白语义为空 → 拒）；上限 4000 字符。
+export const figureCreateSchema = z.object({
+  prompt: z.string().trim().min(1, 'prompt 不能为空').max(4000, 'prompt 过长（≤4000 字符）'),
+})
+
 // 建/改 model provider（models POST/PUT，#336）：snake_case wire（平移 Django
 // ModelProviderWriteSerializer）。provider_id / api_key_env_id 经格式 + 成员校验（r28 §1），
 // api 限两值（r28 §1.3），models 至少一条且每条含非空 id（无 model 无法派生默认模型引用）。

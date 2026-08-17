@@ -1,13 +1,31 @@
 # deploy/docker-compose.deploy.yml —— 面板生产栈（BaoTa 边缘 TLS 之后的应用层）
 #
 # 由 CD（.github/workflows/cd.yml）scp 到宿主 /www/panel/ 并经 `docker compose ... up -d` 启动。
-# 三服务：frontend（唯一对宿主暴露，loopback 18080 供 BaoTa 反代）/ server（内部，TS/Express 控制面，
-# docker.sock 编排 OpenClaw 容器 + SQLite 卷 + researcher 模板只读挂载）/ redis（内部，BullMQ 队列）。
+# 四服务：frontend（唯一对宿主暴露，loopback 18080 供 BaoTa 反代）/ server（内部，TS/Express 控制面，
+# docker.sock 编排 OpenClaw 容器 + SQLite 卷；home 模板与 openclaw.json 构建期入镜像）/ redis（内部，BullMQ 队列）
+# / autofigure（AutoFigure sidecar，T11；仅 panel-net 内部、flag 默认关，详见下方 AutoFigure 段）。
+# 宿主数据挂载唯一豁免：/var/run/docker.sock（ADR 0013，spec §5.4 已接受等价 root）。
 # （#341 M9：backend 服务退役 Django，切换为 server 服务跑 Express 控制面。）
 #
-# 运行时敏感值（JWT_SECRET / PANEL_PUBLIC_ORIGIN / LLM_API_KEY / CREDENTIAL_ENCRYPTION_KEYS）
-# 经同目录 .env（env_file）注入，不落盘进 git；非敏感固定项（REDIS_URL/OPENCLAW_TEMPLATE_DIR/端口）
-# 直接写在本文件。
+# AutoFigure sidecar（T11，docs/autofigure/tickets/T11-production-packaging-cd.md；镜像本体 T08）：
+#   - 第 4 镜像 ghcr.io/acautomata/researcher-service/autofigure（CD 既有管线构建推送，vendored
+#     T08 源，不 fetch mutable upstream；许可/署名文件构建期入镜像，Dockerfile 构建期断言）；
+#   - 仅挂 panel-net、无 ports 无 volumes：私有 sidecar 无宿主端口（grilling §7）、零 host 挂载
+#     （ADR 0013）——宿主/浏览器永不直接访问，只经 server（panel-net 内部）经 X-Autofigure-Api-Key
+#     注入凭证；
+#   - healthcheck：/health 存活性探测（无域信息/凭证），容器内本机探（无宿主端口可依）；
+#   - AUTOFIGURE_ENABLED 生产默认关（显式 ${AUTOFIGURE_ENABLED:-false}）：flag 关 → server 不装配
+#     AutoFigure runtime（不启动 runner、不要求 key/sidecar 可达、figures 路由 90005）、/api/health
+#     独立——sidecar 容器仍随 up -d 启动但未被使用（compose 无 profile/条件服务机制，如实文档化）；
+#     flag 开（宿主 .env 设 true）→ sidecar 故障经 docker compose health（unhealthy）检测，生成失败
+#     走 T07 信封码，不模糊 500；
+#   - 凭证 AUTOFIGURE_LLM_KEY 经 env_file .env 注入（CD 渲染，可选 secret；flag 关空串安全），
+#     由 server 经 X-Autofigure-Api-Key header 注入 sidecar；不落盘/不入日志/不 commit。
+#
+# 运行时敏感值（JWT_SECRET / PANEL_PUBLIC_ORIGIN / LLM_API_KEY / CREDENTIAL_ENCRYPTION_KEYS /
+# AUTOFIGURE_LLM_KEY[可选]）
+# 经同目录 .env（env_file）注入，不落盘进 git；非敏感固定项（REDIS_URL/OPENCLAW_TEMPLATE_DIR/端口/
+# AUTOFIGURE_SIDECAR_URL/AUTOFIGURE_JOB_TIMEOUT_MS）直接写在本文件。
 #
 # 用法（CD 已自动化；手工排障时参考）：
 #   docker compose -f docker-compose.deploy.yml --env-file .env pull
@@ -36,15 +54,21 @@ services:
     env_file:
       - .env
     depends_on:
-      - redis   # 启动顺序：redis 先于 server（仅启动序，非就绪等待；entrypoint 落表阶段给 redis 留出窗口）
+      - redis      # 启动顺序：redis 先于 server（仅启动序，非就绪等待；entrypoint 落表阶段给 redis 留出窗口）
+      - autofigure # 同上：仅启动序（service_started，非 service_healthy）——server 启动/health 不依赖 sidecar 就绪；flag 关路径 sidecar 未被使用，无健康依赖
     environment:
       # 非敏感固定项：config.ts 唯一 env 读取处（server/src/config.ts）。
       NODE_ENV: production
       PORT: "8001"
       REDIS_URL: redis://redis:6379/0
-      OPENCLAW_TEMPLATE_DIR: /srv/openclaw/template
-      # openclaw.json 模板文件：镜像内默认 <cwd>/../deploy/openclaw.json 解析到 /app/../deploy（不存在），
-      # 首次创建容器即 90003；此处注入挂载文件路径（下方 ./openclaw.json 挂载到 /app/deploy/）。
+      # home 模板（provision 的 cp -a 预填充源）：镜像内路径——构建期 COPY 进 server 镜像
+      # （server/Dockerfile COPY --from=template，CD 构建时 clone researcher 注入；ADR 0013
+      # 模板入镜像，不再挂载宿主 /srv/openclaw/template）。
+      OPENCLAW_TEMPLATE_DIR: /app/templates/researcher
+      # openclaw.json 模板文件（配置单一来源，与单容器 compose 共用一份 deploy/openclaw.json）：
+      # 构建期 COPY 进镜像（server/Dockerfile COPY --from=deploy → /app/deploy/openclaw.json），
+      # 此处显式 pin 镜像内路径（默认 <cwd>/../deploy 解析到 /app/../deploy 不存在，首次创建容器
+      # 即 90003）。CD 不再分发/挂载宿主 openclaw.json。
       OPENCLAW_TEMPLATE_JSON: /app/deploy/openclaw.json
       # SQLite 持久化：server 经 DATABASE_URL（Prisma driver adapter）读本 named volume 挂载点，
       # 容器重建数据不丢。必须显式绝对路径——apply-schema.mjs 的 file: 前缀剥离对绝对路径正确。
@@ -57,32 +81,31 @@ services:
       # 仅开 80/443 收敛公网面。生产若需传输加密，后续在网关开 tls 并切 OPENCLAW_FLEET_WS_SCHEME=wss。
       OPENCLAW_FLEET_WS_HOST: host.docker.internal
       OPENCLAW_FLEET_PORT_BIND_HOST: 0.0.0.0
-      # fleet 根显式 pin：与下方 volumes 挂载 /fleet:/fleet 及 readFleetRoot 生产校验默认值
-      # 三者恒同源（spec §5.4/§5.6 契约，server 直操作宿主 OPENCLAW_FLEET_ROOT/instances/<name>/）。
-      # 显式声明防「运维设了错误路径但校验通过」——compose 覆盖为唯一正确值。
+      # fleet 根（容器内工作目录，无宿主挂载）：createComplete 的 instances/<id>/ 目录与
+      # provision cp 都落在容器私有 /fleet（named volume 拓扑下容器不 bind 宿主树，ADR 0011/0013；
+      # 容器重建即空、create 幂等重建）。readFleetRoot 生产校验绝对路径——显式 pin 防相对路径 fallback。
       OPENCLAW_FLEET_ROOT: /fleet
+      # AutoFigure（T11）：sidecar 接线经 panel-net 内部（无宿主端口）。AUTOFIGURE_ENABLED 生产默认
+      # 关（flag 关 → server 不装配 AutoFigure runtime：不启动 runner、不要求 key/sidecar 可达、
+      # figures 路由 90005，/api/health 独立——面板启动/健康不依赖 sidecar）；SIDECAR_URL = 容器内部
+      # 服务名 autofigure:8080（T08 gunicorn 端口）；JOB_TIMEOUT_MS 显式默认 1800000（防空串陷阱，
+      # config.test.ts 有对应用例；生产唯一 AutoFigure 执行超时，不引入第二 timeout）。
+      # AUTOFIGURE_LLM_KEY（可选 secret）经 env_file .env 注入——flag 关空串安全（config 只在
+      # enabled && production 下 fail-fast）。
+      AUTOFIGURE_ENABLED: ${AUTOFIGURE_ENABLED:-false}
+      AUTOFIGURE_SIDECAR_URL: http://autofigure:8080
+      AUTOFIGURE_JOB_TIMEOUT_MS: 1800000
     extra_hosts:
       # Linux host-gateway 映射：server 容器访问宿主 loopback 接口（host.docker.internal）。
       # macOS Docker Desktop 自动提供该名，此处显式声明保证 Linux 生产宿主（BaoTa）可解析。
       - "host.docker.internal:host-gateway"
     volumes:
-      # 控制面等价 root：经宿主 docker.sock 增删查 OpenClaw 容器（spec §5.4 已明示风险）。
+      # 唯一宿主数据挂载（ADR 0013 豁免）：控制面等价 root，经 docker.sock 增删查 OpenClaw 容器
+      # （spec §5.4 已明示风险）。其余数据（SQLite）走 named volume，模板/openclaw.json 在镜像内。
       - /var/run/docker.sock:/var/run/docker.sock
-      # fleet 根（spec §5.4/§5.6 契约）：server 在宿主文件系统操作 OPENCLAW_FLEET_ROOT
-      # /instances/<name>/ —— cp -a 预填充 home + 原子写 openclaw.json + rmtree 删除。
-      # 缺此挂载时 server 容器把配置写到容器私有 /fleet（与宿主 /fleet 隔离），docker run
-      # 的 bind-mount 源路径在宿主侧不存在 → Docker 自动建空目录 → gateway 读到目录而非
-      # 配置文件 → missing gateway.mode 崩溃循环 → unhealthy/502/stop（生产 2026-08-01 实测）。
-      - /fleet:/fleet
       # SQLite 持久化：server 经 DATABASE_URL 指向本 named volume 挂载点 /app/db/db.sqlite3，
       # 容器重建数据不丢。
       - panel-db:/app/db
-      # researcher 模板（home 预填充 cp -a 源）：宿主克隆只读挂载。
-      - /srv/openclaw/template:/srv/openclaw/template:ro
-      # openclaw.json 模板（配置单一来源，与单容器 compose 共用一份 deploy/openclaw.json）：
-      # CD 分发到宿主 /www/panel/openclaw.json（compose 同目录），挂载进 server 容器覆盖镜像内
-      # 不存在的默认路径（/app/deploy/openclaw.json），首次创建容器不再 90003。
-      - ./openclaw.json:/app/deploy/openclaw.json:ro
     networks:
       - panel-net
 
@@ -91,6 +114,35 @@ services:
     container_name: panel-redis
     restart: unless-stopped
     # BullMQ 队列后端；仅内部网络，不对宿主暴露。
+    networks:
+      - panel-net
+
+  # AutoFigure 私有 sidecar（T11，docs/autofigure/tickets/T11-production-packaging-cd.md；镜像本体 T08）：
+  #   - 第 4 镜像：ghcr.io/acautomata/researcher-service/autofigure（CD 既有管线构建推送，vendored T08
+  #     源不 fetch mutable upstream；Dockerfile 构建期断言 + 许可/署名文件入镜像）；PANEL_AUTOFIGURE_IMAGE
+  #     覆盖位对齐 PANEL_*_IMAGE 先例（回滚固定到 :<sha>）；
+  #   - 仅挂 panel-net、无 ports 无 volumes：私有 sidecar 无宿主端口（grilling §7）、零 host 挂载
+  #     （ADR 0013）——宿主/浏览器永不直接访问，只经 server（panel-net 内部）经 X-Autofigure-Api-Key
+  #     注入凭证；
+  #   - healthcheck：/health 存活性探测（无域信息/凭证），容器内本机探（无宿主端口可依）；flag 开时
+  #     sidecar 故障经 docker compose health（unhealthy）在既有部署面检测，不扩 /api/health；
+  #   - mem_limit 2g = T10/T11 judgement call（真实生成 = Playwright 渲染 + LLM 调用内存上限；仓库
+  #     生产服务均无资源限制，此为 AutoFigure 域首个约束，对齐 T10 dev 栈同值）。
+  autofigure:
+    image: ${PANEL_AUTOFIGURE_IMAGE:-ghcr.io/acautomata/researcher-service/autofigure:latest}
+    container_name: panel-autofigure
+    restart: unless-stopped
+    mem_limit: 2g
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
     networks:
       - panel-net
 

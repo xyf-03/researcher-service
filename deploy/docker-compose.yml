@@ -14,7 +14,7 @@
 services:
   openclaw-gateway:
     container_name: openclaw-gateway
-    image: ${OPENCLAW_IMAGE:-ghcr.io/openclaw/openclaw:2026.7.1-browser}   # 官方稳定 browser 变体（ADR 0003）；生产建议 pin digest
+    image: ${OPENCLAW_IMAGE:-ghcr.io/acautomata/researcher-service/openclaw:latest}   # 派生镜像（issue #588，ADR 0013：pdftotext + wiki/workspace 骨架）；可覆盖回官方基线
     # 以 root 运行：A3 delete cleanup（orchestrator）依赖容器还在时以 root chown home 给 host uid；
     # 官方镜像本以 node(1000) 运行，收紧到 node 需配套重做 cleanup（ADR 0003 后续），本次不动。
     user: ${OPENCLAW_RUN_USER:-0:0}

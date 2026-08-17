@@ -80,3 +80,17 @@ export class QuotaExceeded extends ContainerDomainError {
     super(CODE.QUOTA_EXCEEDED, `容器数量已达配额上限: ${containerName}`)
   }
 }
+
+// openclaw.json 写盘失败（#591 起经 FileArchive.putArchive，原 #366 ConfigStore 宿主原子写 seam
+// 已随 config 落容器内撤销）。models service 据此判定「盘未变」→ 事务回滚 DB 行 → 90003
+//（ConfigWriteError 恒 = fs/docker 写失败、盘未变；reconcile 只对「盘已写而事务回滚」触发）。
+// name = 面板实例名（诊断），path = 容器内 config 路径（诊断）。
+export class ConfigWriteError extends Error {
+  constructor(
+    public readonly containerName: string,
+    public readonly path: string,
+  ) {
+    super(`config write failed for ${containerName}: ${path}`)
+    this.name = 'ConfigWriteError'
+  }
+}

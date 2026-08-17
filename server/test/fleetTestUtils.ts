@@ -10,6 +10,8 @@ import { Orchestrator } from '../src/containers/orchestrator'
 import { InlineLifecycleQueue } from '../src/containers/lifecycleQueue'
 import { defaultReservedPorts, type FleetConfig } from '../src/containers/values'
 import { DEV_ENCRYPTION_KEYS } from '../src/crypto'
+import { FileNotFound } from '../src/files/errors'
+import type { FileArchive } from '../src/files/fsPort'
 import { FakeRuntime } from './fakeRuntime'
 
 export interface FleetTestContext {
@@ -18,6 +20,35 @@ export interface FleetTestContext {
   runtime: FakeRuntime
   fleetRoot: string
   config: FleetConfig
+  // #591：config 写读 fake（createComplete 经 putArchive 落容器内 openclaw.json 的断言点）
+  archive: MemoryArchive
+}
+
+// #591：内存 fake FileArchive——编排测试只消费 writeConfig/readConfig（createComplete 落容器内
+// config），文件 CRUD 方法不实现（本域不触达）。
+export class MemoryArchive implements FileArchive {
+  // name → openclaw.json 文本（静态 config 落点：容器内 ~/.openclaw/openclaw.json）
+  readonly configs = new Map<string, string>()
+  async writeConfig(name: string, content: string): Promise<void> {
+    this.configs.set(name, content)
+  }
+  async readConfig(name: string): Promise<string> {
+    const c = this.configs.get(name)
+    if (c === undefined) throw new FileNotFound('openclaw.json')
+    return c
+  }
+  async read(): Promise<never> {
+    throw new Error('files CRUD not used in fleet tests')
+  }
+  async write(): Promise<never> {
+    throw new Error('files CRUD not used in fleet tests')
+  }
+  async create(): Promise<never> {
+    throw new Error('files CRUD not used in fleet tests')
+  }
+  async delete(): Promise<never> {
+    throw new Error('files CRUD not used in fleet tests')
+  }
 }
 
 let seq = 0
@@ -47,11 +78,14 @@ export function makeFleetTest(
     publishHost: '127.0.0.1',
     healthHost: '127.0.0.1',
     panelOrigin: 'http://127.0.0.1:18789', // #385 测试默认与网关 seed 一致
+    namedVolumes: true, // #592 本地/CI 默认 named volume 拓扑（对齐生产；旧 bind 用例显式 false 覆盖）
     reservedPorts: defaultReservedPorts(),
     encryptionKeys: DEV_ENCRYPTION_KEYS,
     ...overrides.config,
   }
   const runtime = new FakeRuntime()
+  // overrides.archive 若提供须为 MemoryArchive 兼容形态（编排测试断言 configs map）
+  const archive: MemoryArchive = overrides.archive === undefined ? new MemoryArchive() : (overrides.archive as MemoryArchive)
   const deps = new FleetDeps(runtime, config, {
     queue: overrides.queue ?? new InlineLifecycleQueue(),
     portInUse: overrides.portInUse ?? (async () => false),
@@ -61,7 +95,8 @@ export function makeFleetTest(
     serializer: overrides.serializer,
     onEvict: overrides.onEvict,
     crypto: overrides.crypto,
+    archive,
   })
   const orch = new Orchestrator(deps, prisma)
-  return { orch, deps, runtime, fleetRoot, config }
+  return { orch, deps, runtime, fleetRoot, config, archive }
 }

@@ -29,9 +29,17 @@ function buildHeaders(init: RequestInit, token: string): Headers {
   return headers
 }
 
+// #312 信封判定只在 JSON body 上有意义；二进制/非 JSON 响应（AutoFigure PNG 原生字节等）不得调用
+// json()——会 drain 流，使后续 blob() 抛 Body is unusable。JSON 判定对齐仓库既有 Content-Type 约定
+// （后端信封响应经 res.json()，恒带 application/json）。
+function isJsonResponse(resp: Response): boolean {
+  return (resp.headers.get('content-type') ?? '').includes('application/json')
+}
+
 // 响应 body 只可读一次（流语义）——把解析结果缓存到响应对象，envelope 判定与 apiJson 复用同一份，
-// 避免对同一响应读两次 json()。
-function parseEnvelopeBody(resp: Response): Promise<unknown> {
+// 避免对同一响应读两次 json()。导出：二进制端点（如 PNG）读错误面信封时复用缓存——apiFetch 已为
+// 10001/10004 检测读取过一次 JSON body，消费方经此读取而非二次 resp.json()（流已消费会 reject）。
+export function parseEnvelopeBody(resp: Response): Promise<unknown> {
   const cached = resp as Response & { __envBody?: unknown }
   if ('__envBody' in cached) return Promise.resolve(cached.__envBody ?? null)
   return resp
@@ -78,7 +86,10 @@ async function refreshAndRetry(path: string, init: RequestInit): Promise<Respons
     const retried = await fetchWithTimeout(path, { ...init, headers: buildHeaders(init, auth.token) })
     const rejected =
       retried.status === 401 ||
-      (retried.status === 200 && ENVELOPE_UNAUTHENTICATED_CODES.has(await envelopeCodeOf(retried)))
+      // 非 JSON 重试响应（二进制成功）不作信封 sniff——不消费 body（见 isJsonResponse）
+      (retried.status === 200 &&
+        isJsonResponse(retried) &&
+        ENVELOPE_UNAUTHENTICATED_CODES.has(await envelopeCodeOf(retried)))
     if (!rejected) return retried
   }
   if (auth.refreshExhausted) {
@@ -93,6 +104,10 @@ async function refreshAndRetry(path: string, init: RequestInit): Promise<Respons
 export async function apiFetch(path: string, init: RequestInit = {}): Promise<Response> {
   const auth = useAuthStore()
   const resp = await fetchWithTimeout(path, { ...init, headers: buildHeaders(init, auth.token) })
+  // HTTP 200 + 非 JSON（二进制成功，如 AutoFigure PNG 原生字节）→ 跳过信封 sniff 原样返回：
+  // 绝不读 body（resp.json() 会 drain 流，使后续 blob() 不可用）。对既有 JSON 调用方行为等价——
+  // 非 JSON 200 的 envelopeCodeOf 恒为 -1，本就不进 10001/10004 分支；差异仅在 body 不再被无谓消费。
+  if (resp.status === 200 && !isJsonResponse(resp)) return resp
   // HTTP 200 但信封码是认证/授权层错误（TS 后端 #312 信封：吊销的 token 以 10001 拒业务请求，
   // HTTP 层恒 200）→ 与 HTTP 401 同语义触发刷新重试链。非信封响应不在此列（走 HTTP 状态）。
   if (resp.status === 200 && ENVELOPE_UNAUTHENTICATED_CODES.has(await envelopeCodeOf(resp))) {

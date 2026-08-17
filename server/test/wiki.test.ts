@@ -1,73 +1,67 @@
-// wiki REST 契约测试（#335 · #315 §8 checklist 对 Express 实现重跑）。
+// wiki REST 契约测试（#335 · #315 §8 checklist 对 Express 实现重跑；#621 起经 serviceFor 注入
+// 内存 fake WikiFileSystem，对齐 files.test.ts 的内存 Port 注入模式——存储适配器行为由
+// wikiDockerFs.test.ts 单测覆盖，本文件钉 REST ↔ Port 接线：信封/错误映射/归属/compile 时机）。
 // 端点 /api/v1/containers/<name>/wiki/{tree,page,graph,categories}；信封（#312）+ 隔离归属前置
 // （#312⑤，越权 20040 同码防探测）+ 错误映射（90002/20040/30040/30041）。compile 经注入 fake
 // 断言触发时机（POST/DELETE 触发、PUT 不触发），不碰真 docker。
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import path from 'node:path'
 import { setupTestApp, type TestContext } from './setup'
 import { seedAdmin, seedUser, login, bearer } from './helpers'
+import { FakeWikiFileSystem } from './fakes'
+import { WikiService } from '../src/wiki/service'
 import type { CompileTrigger } from '../src/wiki/compile'
 
 let seq = 0
 
-// 造一份容器 home（Container.homeDir）：home/wiki/main 骨架（真实子目录 + 未知目录 + 应跳过项 + 顶层散落页）。
-function makeWikiHome(): string {
-  const base = mkdtempSync(path.join(tmpdir(), `wiki-rest-${process.pid}-${seq}-`))
-  const home = path.join(base, 'home')
-  const main = path.join(home, 'wiki', 'main')
-  mkdirSync(path.join(main, 'concepts'), { recursive: true })
-  writeFileSync(
-    path.join(main, 'concepts', 'attention.md'),
-    '---\ntitle: Attention\n---\n# Attention\n见 [[self-attention]]。\n',
-  )
-  const papers = path.join(main, 'domains', 'cv', 'papers')
-  mkdirSync(papers, { recursive: true })
-  writeFileSync(
-    path.join(papers, 'resnet.md'),
-    '---\npaper:\n  title: ResNet\nrelated_pages: [attention]\n---\n# ResNet\n',
-  )
-  mkdirSync(path.join(main, 'experiments'))
-  writeFileSync(path.join(main, 'experiments', 'trial-1.md'), '---\ntitle: Trial 1\n---\n# Trial 1\n')
-  mkdirSync(path.join(main, 'thoughts'))
-  writeFileSync(
-    path.join(main, 'thoughts', 'idea-1.md'),
-    '# First Idea\n\n`category: idea`\n\nIdea 摘录。\n',
-  )
-  mkdirSync(path.join(main, 'entities')) // 空目录 → 不成组
-  mkdirSync(path.join(main, '.openclaw-wiki'))
-  writeFileSync(path.join(main, '.openclaw-wiki', 'cache.md'), 'x')
-  writeFileSync(path.join(main, 'index.md'), '# INDEX')
-  writeFileSync(path.join(main, 'root-note.md'), '# Root Note\n\n`category: rootcat`\n\nRoot 摘录。\n')
-  return home
+// wiki fixture（页集对齐旧 makeWikiHome 真目录 fixture；空目录 entities 无法在内存 fake 表示，
+// 「空目录不成组」由 entities 下无页自然成立）。
+function wikiFixture(): Record<string, string> {
+  return {
+    'concepts/attention.md': '---\ntitle: Attention\n---\n# Attention\n见 [[self-attention]]。\n',
+    'domains/cv/papers/resnet.md': '---\npaper:\n  title: ResNet\nrelated_pages: [attention]\n---\n# ResNet\n',
+    'experiments/trial-1.md': '---\ntitle: Trial 1\n---\n# Trial 1\n',
+    'thoughts/idea-1.md': '# First Idea\n\n`category: idea`\n\nIdea 摘录。\n',
+    '.openclaw-wiki/cache.md': 'x',
+    'index.md': '# INDEX',
+    'root-note.md': '# Root Note\n\n`category: rootcat`\n\nRoot 摘录。\n',
+  }
 }
 
 describe('wiki REST（接缝 #2 信封 + #335）', () => {
   let ctx: TestContext
   const compileCalls: string[] = []
+  // 每容器一个内存 fake WikiFileSystem（seedContainer 注册）；serviceFor 按 name 查，未注册
+  // 给空 fake（对齐「容器存在但无 wiki 数据 → 空树」的降级语义）。
+  const fss = new Map<string, FakeWikiFileSystem>()
   const BASE = '/api/v1/containers'
 
   beforeAll(async () => {
     const fakeCompile: CompileTrigger = { trigger: (name) => { compileCalls.push(name) } }
-    ctx = await setupTestApp({ wiki: { compile: fakeCompile } })
+    ctx = await setupTestApp({
+      wiki: {
+        compile: fakeCompile,
+        serviceFor: (inst) => new WikiService(fss.get(inst.name) ?? new FakeWikiFileSystem()),
+      },
+    })
   })
   afterAll(async () => {
     await ctx.cleanup()
   })
 
-  // 每容器独立 name/port/home（name/port 全局唯一，跨测试不得复用）。
+  // 每容器独立 name/port（name/port 全局唯一，跨测试不得复用）；homeDir 不再被 wiki 存储使用
+  // （#621 Docker 适配器以容器为视角），DB 字段按 schema 必填给占位值。
   async function seedContainer(ownerId: string): Promise<string> {
     seq += 1
     const name = `demo${seq}`
+    fss.set(name, new FakeWikiFileSystem(wikiFixture()))
     await ctx.prisma.container.create({
       data: {
         name,
         port: 19000 + seq,
         ownerId,
         token: 't',
-        homeDir: makeWikiHome(),
+        homeDir: '/unused',
         image: 'img',
         status: 'running',
       },

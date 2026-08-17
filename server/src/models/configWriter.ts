@@ -2,76 +2,72 @@
 //
 // 平移 backend/containers/fleet/command.py#rewrite_config 语义：DB（ModelProvider）为单一来源，
 // 读该容器全部 provider → ProviderConfigBuilder 合并进模板 base（ConfigRenderer 强制 gateway
-// 安全不变量）→ 经 ConfigStore 原子覆盖写 instances/<id>/config/openclaw.json（#366：config
-// 独立目录 ro bind + OPENCLAW_CONFIG_PATH，目录 bind 下 rename 换 inode 容器内可见）。
-// OpenClaw watch 热加载生效，无需 restart（#36 已证）。写盘失败抛 ConfigWriteError → DB 事务
-// 据此回滚（view/service 层）。
+// 安全不变量）→ 经 FileArchive.writeConfig（#591，putArchive）覆盖写容器内
+// ~/.openclaw/openclaw.json（home 卷 / bind home 内）。
+// **静态 config**：对 #366「宿主 rename + ro bind 热加载」的明确回退——写盘后须重启容器生效，
+// 不再依赖 gateway watch 热加载。写盘失败抛 ConfigWriteError → DB 事务据此回滚（view/service 层）。
 //
 // 路由层注入此 Port（AppDeps.models.configWriter）：测试可注入假 writer 测回滚，生产装
-// TemplateModelConfigWriter（真模板 + 原子写）。
+// TemplateModelConfigWriter（真模板 + FileArchive）。
 
-import { readFile, access } from 'node:fs/promises'
-import path from 'node:path'
+import { readFile } from 'node:fs/promises'
 import { CODE } from '../codes'
 import { ConfigRenderer } from '../containers/configRenderer'
-import { ConfigStore } from '../containers/configStore'
-import { ConfigurationError, ContainerDomainError } from '../containers/errors'
-import type { FleetConfig } from '../containers/values'
+import { ConfigWriteError, ConfigurationError, ContainerDomainError } from '../containers/errors'
+import { FileNotFound } from '../files/errors'
+import type { FileArchive } from '../files/fsPort'
 import { ProviderConfigBuilder, type ProviderSpec } from './configBuilder'
 
 export interface ModelConfigWriter {
-  // 把 providers 合并进模板 base 后原子写盘（name 仅诊断、id 定 instances/<id>/ 路径，代系绑定 #360）。
+  // 把 providers 合并进模板 base 后写容器内 openclaw.json（name 定容器、id 仅诊断，代系绑定 #360）。
   rewrite(opts: { name: string; id: string; providers: readonly ProviderSpec[] }): Promise<void>
 }
 
-// 模板写盘依赖面（收窄到所需字段，便于 server.ts 直接传 config.fleet；root 供 ConfigStore
-// 原子写——config 落 instances/<id>/config 独立目录，见 configStore.ts #366 修复说明）
-export type ModelConfigWriterDeps = Pick<FleetConfig, 'root' | 'templateJson' | 'llmApiKey' | 'panelOrigin'>
+// 模板写盘依赖面（收窄到所需字段，便于 server.ts 直接传 config.fleet；archive 供
+// FileArchive.writeConfig 落容器内 config——静态 config，见 fsPort.ts #591 说明）
+export interface ModelConfigWriterDeps {
+  readonly archive: FileArchive
+  readonly templateJson: string
+  readonly llmApiKey: string
+  readonly panelOrigin: string
+}
 
 export class TemplateModelConfigWriter implements ModelConfigWriter {
-  private readonly configStore: ConfigStore
   private renderer: ConfigRenderer | null = null
 
-  constructor(private readonly cfg: ModelConfigWriterDeps) {
-    this.configStore = new ConfigStore(cfg)
-  }
+  constructor(private readonly cfg: ModelConfigWriterDeps) {}
 
   async rewrite({ name, id, providers }: { name: string; id: string; providers: readonly ProviderSpec[] }): Promise<void> {
     // LLM key 未配置 → 90003（ConfigurationError 携带码）。生产 create 已前置 fail-fast
     // （command.ts 同款），此处兜底防「key 被清空后仍写盘成功、provider 不可用」。
     if (!this.cfg.llmApiKey) throw new ConfigurationError('LLM_API_KEY')
-    // #366 codex 三轮 P1「升级路径」：旧代容器 fail-fast（见 ensureLegacyCompatible）。
-    await this.ensureLegacyCompatible(id)
+    // #366 P1 升级路径（#591 以容器内探测复刻）：旧代容器（#366 前的创建，gateway 经
+    // OPENCLAW_CONFIG_PATH 读 ro bind 目录、env 固化）容器内默认路径 ~/.openclaw/openclaw.json
+    // 无文件——putArchive 写入后 gateway 永不读取、API 却报成功（#366 P1「热加载断链」重演）。
+    // 容器内探测：readConfig FileNotFound = 旧代/未初始化 → fail-fast 90003 提示重建；非
+    // FileNotFound（daemon 故障）→ 归写盘失败域（后续 writeConfig 同面暴露）。
+    try {
+      await this.cfg.archive.readConfig(name)
+    } catch (e) {
+      if (e instanceof FileNotFound) {
+        throw new ContainerDomainError(
+          CODE.LLM_NOT_CONFIGURED,
+          `容器为旧版本（容器内无 ~/.openclaw/openclaw.json），模型配置无法写入生效路径——请重建该容器后再配置`,
+        )
+      }
+      throw new ConfigWriteError(name, `${id} ~/.openclaw/openclaw.json read-probe (${(e as Error).message})`)
+    }
     const renderer = await this.ensureRenderer()
     // #385：allowedOrigins 强制含面板 origin（渲染产物与 create 路径同源强制点）
     const merged = new ProviderConfigBuilder().build(renderer.renderDict(this.cfg.panelOrigin), providers)
-    await this.configStore.write(name, id, JSON.stringify(merged, null, 2))
-  }
-
-  // #366 codex 三轮 P1：父版本（master/1d998cd，config 落 instances/<id>/openclaw.json 单文件 ro
-  // bind、无 OPENCLAW_CONFIG_PATH）创建的容器没有 instances/<id>/config 目录。升级后对旧容器 provider
-  // 写盘落新路径（不在容器 mount 内）→ 热加载断链但 API 报成功。fail-fast：目录缺失 → 90003（与写盘
-  // 失败同域信封）提示重建；service 事务据此次异常回滚 DB 行，盘=DB 不发散。ENOENT 才判旧代——其余
-  // fs 错误（EACCES 等）上抛，让写入阶段如实暴露，不误标「旧代」。
-  // create 流程不经过本 writer（createComplete 直连 ConfigStore），且新代 create 必建该目录，故只拦旧代。
-  private async ensureLegacyCompatible(id: string): Promise<void> {
-    const configDir = path.join(this.cfg.root, 'instances', id, 'config')
     try {
-      await access(configDir)
+      // #591：config 落容器内 ~/.openclaw/openclaw.json（putArchive），零宿主数据路径。
+      // 静态 config：写盘后须重启容器生效（对 #366 热加载的明确回退）。
+      await this.cfg.archive.writeConfig(name, JSON.stringify(merged, null, 2))
     } catch (e) {
-      if ((e as NodeJS.ErrnoException).code === 'ENOENT') {
-        throw new ContainerDomainError(
-          CODE.LLM_NOT_CONFIGURED,
-          `容器为旧版本（缺 ${configDir} 目录），模型配置无法热加载到运行中的容器——请重建该容器后再配置`,
-        )
-      }
-      // #366 codex 四轮 P2：非 ENOENT 的 probe 失败（EACCES——服务账号不可遍历 instances/<id>）
-      // 包成 90003 与写盘路径同域——否则裸 fs 错误落全局兜底 90000，同一权限故障 probe 与
-      // write（ConfigWriteError → 90003）分类不一致。
-      throw new ContainerDomainError(
-        CODE.LLM_NOT_CONFIGURED,
-        `config 目录探测失败 ${configDir}: ${(e as Error).message}`,
-      )
+      // 写盘失败（容器缺失/daemon 故障/IO）→ ConfigWriteError：service 据它判定「盘未变」→
+      // 事务回滚 DB 行（90003）、不触发 reconcile（#366 codex 四轮 P2：多余写盘 = stale-write 竞态面）。
+      throw new ConfigWriteError(name, `${id} ~/.openclaw/openclaw.json (${(e as Error).message})`)
     }
   }
 

@@ -83,12 +83,12 @@ _load_env() {
 }
 
 _ensure_fleet_image() {
-  # 容器编排（POST /containers）依赖镜像已 pull：本机默认官方 browser 变体
-  # ghcr.io/openclaw/openclaw:2026.7.1-browser（ADR 0003）未 pull 时 docker run 会触发 pull 阻塞/失败，
+  # 容器编排（POST /containers）依赖镜像已 pull：本机默认派生镜像（issue #588，ADR 0013：
+  # pdftotext + wiki/workspace 骨架，基官方 browser 变体）未 pull 时 docker run 会触发 pull 阻塞/失败，
   # 前端表现为「容器一直 creating」。docker daemon 不可达时跳过（driver 仍起前后端，仅容器创建不可用）。
   command -v docker >/dev/null 2>&1 || return 0
   docker info >/dev/null 2>&1 || { echo "[driver] 警告: docker daemon 不可达，容器创建将不可用"; return 0; }
-  local image="${OPENCLAW_IMAGE:-ghcr.io/openclaw/openclaw:2026.7.1-browser}"
+  local image="${OPENCLAW_IMAGE:-ghcr.io/acautomata/researcher-service/openclaw:latest}"   # 派生镜像（issue #588）；可覆盖回官方基线
   if ! docker image inspect "$image" >/dev/null 2>&1; then
     echo "[driver] 预拉 fleet 镜像 $image …"
     if docker pull "$image"; then

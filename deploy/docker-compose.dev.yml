@@ -1,0 +1,143 @@
+# deploy/docker-compose.dev.yml —— 面板 dev 栈（控制面容器化，issue #594 / ADR 0013）
+#
+# 与 prod（deploy/docker-compose.deploy.yml）同形态：server（TS/Express 控制面，复用 prod
+# Dockerfile 构建产物）挂 docker.sock 编排 OpenClaw 容器（named volume 拓扑，ADR 0011）+ redis
+# （BullMQ 队列）。消除「dev 直跑摸不到 named volume」分叉（ADR 0012：宿主直跑时 named volume
+# 物理路径在 Docker VM 内不可达，dev/prod 寻址与路径语义由此分叉）。
+#
+# 与 prod 的差异（仅 dev 必需项）：
+#   - NODE_ENV=development（走 config.ts dev 分支：JWT_SECRET / PANEL_PUBLIC_ORIGIN /
+#     CREDENTIAL_ENCRYPTION_KEYS 用 dev 默认，cookie Secure 关）；
+#   - server 暴露 127.0.0.1:8001:8001（frontend vite dev 在宿主跑，proxy /api、/ws → :8001；
+#     prod server 不暴露，走内部 panel-net 由 frontend nginx 反代）；
+#   - 本地 build（非 GHCR image），additional_contexts 自备 template（本地 researcher 克隆）
+#     与 deploy（本目录 openclaw.json）——prod 由 CD 注入同两 context（见 cd.yml build-contexts）；
+#   - 独立 named volume panel-dev-db（与 prod panel-db 隔离）。
+#
+# AutoFigure sidecar（T10，docs/autofigure/tickets/T10-dev-sidecar-smoke.md）：
+#   - autofigure 服务从 deploy/autofigure-sidecar 构建（build context 基准 = 本目录 deploy/，对齐
+#     server 的 ../server），仅挂 panel-dev-net——私有 sidecar 无宿主端口、零 host 挂载（grilling §10）；
+#   - server 经 env 注入 AUTOFIGURE_* 四键（AUTOFIGURE_ENABLED 默认关；flag 关 → 不装配 AutoFigure
+#     runtime，queued 不迁移，sidecar 不参与面板启动/health 依赖——start 顺序仅 service_started，
+#     不强制 service_healthy，flag 关路径零影响）；凭证 AUTOFIGURE_LLM_KEY 仅经 env 插值（不落盘/
+#     不入日志/不 commit 默认凭证），由 server 经 X-Autofigure-Api-Key header 注入 sidecar；
+#   - JOB_TIMEOUT_MS 显式默认 1800000（`${VAR:-}` 无默认 → 空串 → Number('')=0 fail-fast，config.test.ts
+#     有对应用例）；smoke 场景见 deploy/README.md（AUTOFIGURE_SMOKE=1 + key 经 docker compose exec）。
+#
+# 用法：
+#   1. 克隆 researcher 到仓库根（additional_contexts template= 默认 ../researcher）：
+#        git clone --depth 1 https://github.com/ACautomata/researcher ./researcher
+#      或设 RESEARCHER_DIR 指向已有克隆。
+#   2. （真编排需）备派生镜像 + LLM key（config.ts dev 缺省可起控制面/登录，建容器才需）：
+#        docker build -t ghcr.io/acautomata/researcher-service/openclaw:latest deploy/openclaw-image
+#        export LLM_API_KEY=...
+#   3. 起栈：docker compose -f deploy/docker-compose.dev.yml up -d --build
+#   4. 前端：cd frontend && npm run dev（vite proxy /api、/ws → 127.0.0.1:8001）
+#   5. 改 server 代码：docker compose -f deploy/docker-compose.dev.yml up -d --build server
+#   6. （AutoFigure smoke，可选）起真 sidecar 需 key：export AUTOFIGURE_ENABLED=true
+#        AUTOFIGURE_LLM_KEY=...，重启 server；再按 deploy/README.md 跑门控真实生成 smoke。
+
+name: panel-dev
+
+services:
+  server:
+    build:
+      context: ../server
+      # prod Dockerfile 的 COPY --from=template / --from=deploy 需 buildx 多 context；dev 本地经
+      # additional_contexts 自备（路径基准 = 本目录 deploy/）。
+      additional_contexts:
+        template: ${RESEARCHER_DIR:-../researcher}   # home 模板（provision cp -a 预填充源）
+        deploy: .                                     # openclaw.json 配置单一来源
+    image: panel-server:dev
+    container_name: panel-dev-server
+    restart: unless-stopped
+    depends_on:
+      - redis      # 启动顺序：redis 先于 server（仅启动序，非就绪等待；entrypoint 落表阶段给 redis 留出窗口，同 prod）
+      - autofigure # 同上：仅启动序（service_started，非 service_healthy）——flag 关路径不依赖 sidecar 就绪，dev 栈不因 sidecar 卡死
+    ports:
+      # dev 特有：暴露给宿主 vite dev proxy（prod server 不暴露）。仅 loopback。
+      - "127.0.0.1:8001:8001"
+    environment:
+      # 与 prod 逐一对齐，仅 NODE_ENV 不同。config.ts 唯一 env 读取处（server/src/config.ts）。
+      NODE_ENV: development
+      PORT: "8001"
+      REDIS_URL: redis://redis:6379/0
+      # home 模板与 openclaw.json：镜像内路径（构建期 COPY 入镜像，ADR 0013，同 prod）。
+      OPENCLAW_TEMPLATE_DIR: /app/templates/researcher
+      OPENCLAW_TEMPLATE_JSON: /app/deploy/openclaw.json
+      # SQLite 持久化：dev 独立 named volume 挂载点（与 prod panel-db 隔离）。
+      DATABASE_URL: file:/app/db/db.sqlite3
+      # fleet 寻址（server 容器化，同 prod）：经 host.docker.internal 寻址宿主 0.0.0.0 发布的
+      # fleet gateway 端口——健康探测/WS 配对/对话共用同一 host。
+      OPENCLAW_FLEET_WS_HOST: host.docker.internal
+      OPENCLAW_FLEET_PORT_BIND_HOST: 0.0.0.0
+      # fleet 根（容器内工作目录，无宿主挂载）：createComplete 的 instances/<id>/ 落容器私有
+      # /fleet（named volume 拓扑下容器不 bind 宿主树；容器重建即空、create 幂等重建）。
+      OPENCLAW_FLEET_ROOT: /fleet
+      # 敏感项：仅 LLM_API_KEY 显式列（shell 可选注入，空串安全 = config.ts dev 缺省 ''）；
+      # JWT_SECRET / CREDENTIAL_ENCRYPTION_KEYS 不列，走 config.ts dev 默认。不设
+      # OPENCLAW_NAMED_VOLUMES（保持默认 true，named volume 拓扑，与 prod 同效）。
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      # AutoFigure（T10）：sidecar 接线经 panel-dev-net 内部（无宿主端口）。AUTOFIGURE_ENABLED 默认
+      # 关（flag 关 → 不装配 AutoFigure runtime，生产/公开 API 契约不变）；SIDECAR_URL 默认容器内部
+      # 服务名 autofigure:8080（T08 行动项「T10 接线对齐」取实际 gunicorn 端口）；LLM_KEY 仅经 env
+      # 插值（不 commit 假/默认凭证）；JOB_TIMEOUT_MS 显式默认 1800000（空串陷阱见 config.test.ts）。
+      AUTOFIGURE_ENABLED: ${AUTOFIGURE_ENABLED:-false}
+      AUTOFIGURE_LLM_KEY: ${AUTOFIGURE_LLM_KEY:-}
+      AUTOFIGURE_SIDECAR_URL: ${AUTOFIGURE_SIDECAR_URL:-http://autofigure:8080}
+      AUTOFIGURE_JOB_TIMEOUT_MS: ${AUTOFIGURE_JOB_TIMEOUT_MS:-1800000}
+    extra_hosts:
+      # Linux host-gateway 映射：server 容器访问宿主 loopback 接口（host.docker.internal）。
+      # macOS Docker Desktop 自动提供该名，此处显式声明对齐 prod（保证 Linux 宿主可解析）。
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # 唯一宿主数据挂载（ADR 0013 豁免）：控制面经 docker.sock 增删查 OpenClaw 容器。
+      - /var/run/docker.sock:/var/run/docker.sock
+      # SQLite 持久化：DATABASE_URL 指向本 named volume 挂载点 /app/db/db.sqlite3。
+      - panel-dev-db:/app/db
+    networks:
+      - panel-dev-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: panel-dev-redis
+    restart: unless-stopped
+    # BullMQ 队列后端；仅内部网络，不对宿主暴露（同 prod）。
+    networks:
+      - panel-dev-net
+
+  # AutoFigure 私有 sidecar（T10，docs/autofigure/tickets/T10-dev-sidecar-smoke.md；镜像本体 T08）：
+  #   - build context 基准 = 本目录 deploy/ → deploy/autofigure-sidecar（Dockerfile 构建期断言 + zero
+  #     host mount，ADR 0013）；
+  #   - 仅挂 panel-dev-net，无 ports 无 volumes：私有 sidecar 无宿主端口（grilling §7）、零 host 挂载
+  #     （grilling §10）——宿主/浏览器永不直接访问，只经 server（panel-net 内部）经 X-Autofigure-Api-Key
+  #     注入凭证；
+  #   - healthcheck：/health 存活性探测（无域信息/凭证），容器内本机探（无宿主端口可依）；
+  #   - mem_limit 2g = T10 judgement call（真实生成 = Playwright 渲染 + LLM 调用的内存上限，仅 dev 栈
+  #     约束，不构成 prod 契约——prod 打包归 T11）。
+  autofigure:
+    build:
+      context: autofigure-sidecar
+    image: autofigure-sidecar:dev
+    container_name: panel-dev-autofigure
+    restart: unless-stopped
+    mem_limit: 2g
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+    networks:
+      - panel-dev-net
+
+networks:
+  panel-dev-net:
+    driver: bridge
+
+volumes:
+  panel-dev-db:

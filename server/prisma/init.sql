@@ -94,6 +94,33 @@ CREATE TABLE "model_providers" (
     CONSTRAINT "model_providers_containerId_fkey" FOREIGN KEY ("containerId") REFERENCES "containers" ("id") ON DELETE CASCADE ON UPDATE CASCADE
 );
 
+-- CreateTable
+CREATE TABLE "figures" (
+    "id" TEXT NOT NULL PRIMARY KEY,
+    "ownerId" TEXT NOT NULL,
+    "prompt" TEXT NOT NULL,
+    "idempotencyKey" TEXT,
+    "xml" TEXT,
+    "png" BLOB,
+    "evaluation" TEXT,
+    "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" DATETIME NOT NULL,
+    CONSTRAINT "figures_ownerId_fkey" FOREIGN KEY ("ownerId") REFERENCES "users" ("id") ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+-- CreateTable
+CREATE TABLE "generation_jobs" (
+    "id" TEXT NOT NULL PRIMARY KEY,
+    "figureId" TEXT NOT NULL,
+    "status" TEXT NOT NULL DEFAULT 'queued',
+    "errorMessage" TEXT,
+    "startedAt" DATETIME,
+    "finishedAt" DATETIME,
+    "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" DATETIME NOT NULL,
+    CONSTRAINT "generation_jobs_figureId_fkey" FOREIGN KEY ("figureId") REFERENCES "figures" ("id") ON DELETE CASCADE ON UPDATE CASCADE
+);
+
 -- CreateIndex
 CREATE UNIQUE INDEX "users_username_key" ON "users"("username");
 
@@ -138,4 +165,13 @@ CREATE UNIQUE INDEX "pairings_containerId_key" ON "pairings"("containerId");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "model_providers_containerId_providerId_key" ON "model_providers"("containerId", "providerId");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "figures_ownerId_idempotencyKey_key" ON "figures"("ownerId", "idempotencyKey");
+
+-- CreateIndex
+CREATE INDEX "figures_ownerId_idx" ON "figures"("ownerId");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "generation_jobs_figureId_key" ON "generation_jobs"("figureId");
 

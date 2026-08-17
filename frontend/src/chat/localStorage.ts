@@ -17,3 +17,14 @@ export function getSafeLocalStorage(): Storage | null {
     return null
   }
 }
+
+// sessionStorage 安全读取（#564 outbox 待发队列存储层；同款 try/catch 降级——隐私模式/受限上下文
+// 下访问 sessionStorage 同样可能抛异常）。
+export function getSafeSessionStorage(): Storage | null {
+  try {
+    const storage = globalThis.sessionStorage
+    return isStorage(storage) ? storage : null
+  } catch {
+    return null
+  }
+}

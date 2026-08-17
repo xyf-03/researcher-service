@@ -1,5 +1,5 @@
 // 读写两侧共享依赖的单一装配点（平移 backend/containers/fleet/deps.py，#334）。
-// 打包 runtime/config/provisioner/allocator/configStore/lock/queue/crypto/dirRemover/portInUse/health，
+// 打包 runtime/config/provisioner/allocator/archive/lock/queue/crypto/dirRemover/portInUse/health，
 // 默认绑定在此一处解析；runtime 与 config 为构造必填（调用方注入），测试可单点替换任一依赖。
 
 import { rm } from 'node:fs/promises'
@@ -8,7 +8,8 @@ import type { ContainerRuntime } from './runtime'
 import type { FleetConfig } from './values'
 import { PortAllocator } from './ports'
 import { HomeProvisioner } from './provisioner'
-import { ConfigStore } from './configStore'
+import { DockerFileArchive } from '../files/dockerArchive'
+import type { FileArchive } from '../files/fsPort'
 import { NameLeaseMap } from './leaseMap'
 import { InlineLifecycleQueue, NameSerializer, type LifecycleQueue } from './lifecycleQueue'
 import { AesGcmCrypto, type CryptoPort } from '../crypto'
@@ -65,6 +66,8 @@ export interface FleetDepsOverrides {
   onEvict?: EvictHook
   crypto?: CryptoPort
   quotaSerializer?: NameSerializer
+  // #591：openclaw.json 写读（putArchive/getArchive）——测试注入内存 fake；缺省真 DockerFileArchive
+  archive?: FileArchive
 }
 
 export class FleetDeps {
@@ -75,7 +78,8 @@ export class FleetDeps {
   readonly health: HealthProbe
   readonly provisioner: HomeProvisioner
   readonly allocator: PortAllocator
-  readonly configStore: ConfigStore
+  // #591：容器文件写读 Port（config 落容器内 ~/.openclaw/openclaw.json，静态 config）
+  readonly archive: FileArchive
   // 进程内互斥（不依赖 Redis）：create 双创建防护 + delete/reconcile 在飞探测
   readonly lock: NameLeaseMap
   // 后台队列（生产 BullMQ；测试 inline）+ 按 name 串行器（消 delete/create 竞态）
@@ -95,7 +99,7 @@ export class FleetDeps {
     this.health = overrides.health ?? makeHttpHealthProbe(config.healthHost)
     this.provisioner = new HomeProvisioner(config.templateDir)
     this.allocator = new PortAllocator(config.portStart, config.portEnd, config.reservedPorts)
-    this.configStore = new ConfigStore(config)
+    this.archive = overrides.archive ?? new DockerFileArchive()
     this.lock = overrides.lock ?? new NameLeaseMap()
     this.queue = overrides.queue ?? new InlineLifecycleQueue()
     this.serializer = overrides.serializer ?? new NameSerializer()

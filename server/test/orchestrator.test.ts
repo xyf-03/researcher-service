@@ -47,20 +47,17 @@ describe('orchestrator (接缝 #5 编排器 Port)', () => {
     const row = await ctx.prisma.container.findUnique({ where: { name: 'web-one' } })
     expect(row?.status).toBe('running')
     expect(row?.containerId).not.toBe('')
-    // runtime 已起容器，bind-mount home + config(ro) + 端口映射 + label 所有权
+    // runtime 已起容器，bind-mount home + 端口映射 + label 所有权
     const rec = fl.runtime.containers.get('web-one')
     expect(rec?.spec.hostPort).toBe(19000)
     expect(rec?.info.instanceName).toBe('web-one')
-    // config 已原子落盘 + 安全不变量（port 18789 / bind lan / token 占位）
-    // #366：config 落 instances/<id>/config 独立目录（ro bind + OPENCLAW_CONFIG_PATH）
-    const cfgText = require('node:fs').readFileSync(
-      path.join(fl.fleetRoot, 'instances', inst.id, 'config', 'openclaw.json'),
-      'utf8',
-    )
-    const cfg = JSON.parse(cfgText)
+    // config 已经 FileArchive.putArchive 落容器内（#591 静态 config）+ 安全不变量（port 18789 /
+    // bind lan / token 占位）；createComplete 顺序：create（不启动）→ 写 config → start
+    const cfg = JSON.parse(await fl.archive.readConfig('web-one'))
     expect(cfg.gateway.port).toBe(18789)
     expect(cfg.gateway.bind).toBe('lan')
     expect(cfg.gateway.auth.token).toBe('${GATEWAY_TOKEN}')
+    expect(rec?.info.running).toBe(true) // start 后 running（config 已先落容器内）
   })
 
   it('LLM key 缺失 → ConfigurationError（90003），不占端口不建行', async () => {
@@ -152,7 +149,9 @@ describe('orchestrator (接缝 #5 编排器 Port)', () => {
 
   it('delete 完整生命周期：stop+remove 容器、清目录、删行、触发 evict', async () => {
     const evicted: { name: string; port: number }[] = []
+    // 显式旧 bind：本用例断言 chown 前置（宿主目录清理语义；named volume 模式跳过 chown，#590）
     const fl3 = makeFleetTest(ctx.prisma, {
+      config: { namedVolumes: false },
       onEvict: async (i) => {
         evicted.push(i)
       },
@@ -262,14 +261,17 @@ describe('orchestrator (接缝 #5 编排器 Port)', () => {
   })
 
   // ---- chown 停止容器处理（Codex 第四轮②[P2]）----
-  // stopAndRemove 按 live.running 分叉：
+  // stopAndRemove 按 live.running 分叉（本组为旧 bind 清理语义，显式 namedVolumes: false——卷模式
+  // 跳过 chown 前置，#590）：
   // - running 容器：chown best-effort（ro 挂载的 openclaw.json 让 chown -R 报错属预期，目录仍可删）。
   // - stopped 容器：docker 无法在 stopped 容器内 exec chown，但 root 进程可能已在 home 留 root 属主
   //   文件；直接 remove 让非 root 控制面永久删不掉目录、行卡 REMOVING 无解。修法：start 恢复 → chown
   //   修复 → 再 stop；修复失败 → 抛 InstanceCleanupError 保留容器 + REMOVING 行（不 remove 保留机会）。
+  const chownFleet = () =>
+    makeFleetTest(ctx.prisma, { config: { portStart: 19600, portEnd: 19610, namedVolumes: false } })
 
   it('chown: running 容器 chown 失败（ro 文件报错属预期）→ best-effort 吞掉、正常清理', async () => {
-    const fl2 = makeFleetTest(ctx.prisma, { config: { portStart: 19600, portEnd: 19610 } })
+    const fl2 = chownFleet()
     // execSync 一律抛错（模拟 running 容器内 chown -R 撞 ro openclaw.json）。
     fl2.runtime.execSync = async () => {
       throw new Error('changing ownership: Read-only file system')
@@ -282,7 +284,7 @@ describe('orchestrator (接缝 #5 编排器 Port)', () => {
   })
 
   it('chown: 容器被外部停止 → start 恢复 → chown 修复 → 正常清理（root 属主文件可删）', async () => {
-    const fl2 = makeFleetTest(ctx.prisma, { config: { portStart: 19600, portEnd: 19610 } })
+    const fl2 = chownFleet()
     await fl2.orch.create('r4-extstop', ownerId)
     // stopped 分支：start 恢复容器后执行一次 chown（修复 root 属主文件）→ 成功。
     const chowns: string[] = []
@@ -299,7 +301,7 @@ describe('orchestrator (接缝 #5 编排器 Port)', () => {
   })
 
   it('chown: 容器已停且 start 也无法修复 → 抛错保留容器（不 remove 不留 root 目录孤儿）', async () => {
-    const fl2 = makeFleetTest(ctx.prisma, { config: { portStart: 19600, portEnd: 19610 } })
+    const fl2 = chownFleet()
     // execSync 对任意 name 都抛（start 恢复后重试仍失败）→ stopAndRemove 整体抛 InstanceCleanupError。
     fl2.runtime.execSync = async () => {
       throw new Error('daemon unreachable')
@@ -356,11 +358,12 @@ describe('orchestrator (接缝 #5 编排器 Port)', () => {
   })
 })
 
-// ---- #2 createComplete 在 runtime.run() 后未重查取消（Codex 第七轮 P2）----
-// command.ts createComplete 的取消检查点在循环开头（render 前）与 render 后 run 前，run 之后无检查点。
-// DELETE 在 runtime.run()（拉镜像/启动）期间到达时：deleteReserve 已 flag + 标 removing，但 run 返回后
-// createComplete 直接 update(status:'running') 覆盖 removing——错过取消回滚路径，list 轮询全程显示 running。
-describe('#2 createComplete run 后重查取消 (Codex 第七轮 P2)', () => {
+// ---- #2 createComplete 在 runtime.create() 后未重查取消（Codex 第七轮 P2）----
+// command.ts createComplete 的取消检查点在循环开头（render 前）与 render 后 create 前、start 后
+// （#591：create → writeConfig → start）。DELETE 在 runtime.create()（拉镜像/创建容器）期间到达时：
+// deleteReserve 已 flag + 标 removing，但 create 返回后 createComplete 仍会 start + update
+// (status:'running') 覆盖 removing——错过取消回滚路径，list 轮询全程显示 running。
+describe('#2 createComplete create 后重查取消 (Codex 第七轮 P2)', () => {
   let ctx: TestContext
   let ownerId: string
   beforeAll(async () => {
@@ -371,22 +374,132 @@ describe('#2 createComplete run 后重查取消 (Codex 第七轮 P2)', () => {
     await ctx.cleanup()
   })
 
-  it('DELETE 在 run 期间到达 → run 后重查取消、走回滚（修前 update running 覆盖 removing）', async () => {
+  it('DELETE 在 create 期间到达 → create 后重查取消、走回滚（修前 update running 覆盖 removing）', async () => {
     const fl = makeFleetTest(ctx.prisma)
     const name = 'cancel-run'
     const inst = await fl.orch.createReserve(name, ownerId)
-    // 注入：run 执行期间 DELETE 到达（flag + 标 removing），然后正常起容器。
-    const realRun = fl.runtime.run.bind(fl.runtime)
-    vi.spyOn(fl.runtime, 'run').mockImplementation(async (spec) => {
-      await fl.orch.deleteReserve(spec.name) // 模拟 DELETE 在 run（拉镜像/启动）中到达
-      return realRun(spec)
+    // 注入：create 执行期间 DELETE 到达（flag + 标 removing），然后正常创建容器。
+    const realCreate = fl.runtime.create.bind(fl.runtime)
+    vi.spyOn(fl.runtime, 'create').mockImplementation(async (spec) => {
+      await fl.orch.deleteReserve(spec.name) // 模拟 DELETE 在 create（拉镜像/创建）中到达
+      return realCreate(spec)
     })
-    // createComplete(preserveErrorRow=true 后台路径)：run 后应重查取消 → finalizeFailedCreate。
+    // createComplete(preserveErrorRow=true 后台路径)：start 后应重查取消 → finalizeFailedCreate。
     await expect(fl.orch.createComplete(inst, true)).rejects.toThrow()
     const row = await ctx.prisma.container.findUnique({ where: { name } })
     // 修前：update running 覆盖 removing → status='running'；修后：finalizeFailedCreate 标 error。
     expect(row?.status).toBe('error')
     // 修前：容器驻留（run 起的）；修后：finalizeFailedCreate 清理容器。
     expect(fl.runtime.containers.has(name)).toBe(false)
+  })
+})
+
+// #590/#592 named volume 拓扑编排（ADR 0011，OPENCLAW_NAMED_VOLUMES）
+// 默认（本地/CI，#592）：createComplete 的 spec 携带代系 id（#360）派生三卷名；delete / bind
+// 冲突清残留连带 docker volume rm 三卷（fake runtime 记录断言）。显式 false（旧 bind）：spec 不
+// 携带 volumes、delete 不删卷。每用例独立 makeFleetTest（removedVolumes 记录无跨用例耦合）。
+describe('named volume 编排（#590/#592）', () => {
+  let ctx: TestContext
+  let ownerId: string
+  beforeAll(async () => {
+    ctx = await setupTestApp()
+    ownerId = (await seedUser(ctx.prisma, 'owner-nv', 'pw-nv-secure')).id
+  })
+  afterAll(async () => {
+    await ctx.cleanup()
+  })
+
+  const nvFleet = () => makeFleetTest(ctx.prisma, { config: { namedVolumes: true } })
+  const oldBindFleet = () => makeFleetTest(ctx.prisma, { config: { namedVolumes: false } })
+  const volNames = (id: string) => ({
+    wiki: `openclaw-wiki-${id}`,
+    workspace: `openclaw-workspace-${id}`,
+    home: `openclaw-home-${id}`,
+  })
+
+  it('默认（#592 新默认）：createComplete 的 spec 携带代系 id 派生三卷名', async () => {
+    const fl = makeFleetTest(ctx.prisma)
+    const inst = await fl.orch.createReserve('nv-default', ownerId)
+    await fl.orch.createComplete(inst, true)
+    expect(fl.runtime.containers.get('nv-default')?.spec.volumes).toEqual(volNames(inst.id))
+  })
+
+  it('显式 false（旧 bind）：spec 不携带 volumes（旧行为保留）', async () => {
+    const fl = oldBindFleet()
+    const inst = await fl.orch.createReserve('old-bind', ownerId)
+    await fl.orch.createComplete(inst, true)
+    expect(fl.runtime.containers.get('old-bind')?.spec.volumes).toBeUndefined()
+  })
+
+  it('flag 开启：delete 连带 docker volume rm 三卷（代系 id 派生），容器也删', async () => {
+    const fl = nvFleet()
+    const inst = await fl.orch.createReserve('nv-del', ownerId)
+    await fl.orch.createComplete(inst, true)
+    await fl.orch.delete('nv-del')
+    expect(fl.runtime.removedVolumes).toEqual([
+      volNames(inst.id).wiki,
+      volNames(inst.id).workspace,
+      volNames(inst.id).home,
+    ])
+    expect(fl.runtime.containers.has('nv-del')).toBe(false)
+  })
+
+  it('flag 开启：run bind 冲突换端口重试，清残留容器连带删卷', async () => {
+    const fl = nvFleet()
+    const inst = await fl.orch.createReserve('nv-bind', ownerId)
+    fl.runtime.bindConflictPorts.add(inst.port)
+    await fl.orch.createComplete(inst, true)
+    const rec = fl.runtime.containers.get('nv-bind')
+    expect(rec?.spec.hostPort).not.toBe(inst.port) // 换端口成功
+    // 第一次 run 的残留容器被 remove 时连带删卷
+    expect(fl.runtime.removedVolumes).toEqual([
+      volNames(inst.id).wiki,
+      volNames(inst.id).workspace,
+      volNames(inst.id).home,
+    ])
+  })
+
+  it('flag 开启：容器已被外部删除（live null）→ delete 仍连带删卷（防卷泄漏，对齐 flag 关 dirRemover 语义）', async () => {
+    const fl = nvFleet()
+    const inst = await fl.orch.createReserve('nv-ext-del', ownerId)
+    await fl.orch.createComplete(inst, true)
+    fl.runtime.containers.delete('nv-ext-del') // 外部 actor 删容器（不入库标记）
+    await fl.orch.delete('nv-ext-del')
+    expect(fl.runtime.removedVolumes).toEqual([
+      volNames(inst.id).wiki,
+      volNames(inst.id).workspace,
+      volNames(inst.id).home,
+    ])
+    // 行已删（外部删容器不阻断 delete 收尾）
+    expect(await ctx.prisma.container.findUnique({ where: { name: 'nv-ext-del' } })).toBeNull()
+  })
+
+  it('flag 开启：run 失败且容器未驻留（外部已删）→ finalizeFailedCreate 连带删卷', async () => {
+    const fl = nvFleet()
+    const inst = await fl.orch.createReserve('nv-fail-ext', ownerId)
+    fl.runtime.failRunFor.add('nv-fail-ext') // run 抛非 bind 错 → finalizeFailedCreate
+    await expect(fl.orch.createComplete(inst, true)).rejects.toThrow()
+    expect(fl.runtime.removedVolumes).toEqual([
+      volNames(inst.id).wiki,
+      volNames(inst.id).workspace,
+      volNames(inst.id).home,
+    ])
+  })
+
+  it('flag 开启：delete 跳过 chown 前置（卷随删，chown 只服务宿主 bind 目录清理）', async () => {
+    const fl = nvFleet()
+    const inst = await fl.orch.createReserve('nv-nochown', ownerId)
+    await fl.orch.createComplete(inst, true)
+    await fl.orch.delete('nv-nochown')
+    expect(fl.runtime.execCalls).toEqual([]) // 无 chown execSync（flag 关时必有一条）
+    expect(fl.runtime.removedVolumes).toHaveLength(3)
+  })
+
+  it('显式 false（旧 bind）：delete 不删卷（旧行为）', async () => {
+    const fl = oldBindFleet()
+    const inst = await fl.orch.createReserve('old-del', ownerId)
+    await fl.orch.createComplete(inst, true)
+    await fl.orch.delete('old-del')
+    expect(fl.runtime.removedVolumes).toEqual([])
   })
 })

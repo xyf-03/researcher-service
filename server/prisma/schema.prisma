@@ -51,6 +51,7 @@ model User {
   containers    Container[]
   refreshTokens RefreshToken[]
   textTraceLogs TextTraceLog[]
+  figures       Figure[]
 
   @@map("users")
 }
@@ -209,4 +210,68 @@ model ModelProvider {
 
   @@unique([containerId, providerId])
   @@map("model_providers")
+}
+
+// ---------------------------------------------------------------------------
+// Figure —— AutoFigure 用户可见领域资源（docs/autofigure/spec.md §1 · grilling §2）。
+// Figure 1:1 GenerationJob（两表职责分离：Figure 承载领域资源语义，Job 承载执行状态）。
+// ownerId 只由认证的 researcher-service 身份（JWT）派生，永不来自客户端提交（grilling §3）。
+// V1 无 Figure 删除（owner 与 admin 均无），本模型不含删除/软删语义。
+// ---------------------------------------------------------------------------
+model Figure {
+  id      String @id @default(cuid())
+  owner   User   @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  ownerId String
+  prompt  String // 用户可见的 text-to-figure 生成输入（zod 校验后入库）
+
+  // T02 幂等（docs/autofigure/tickets/T02-idempotent-figure-creation.md · grilling §17）：
+  // Idempotency-Key 按 (ownerId, idempotencyKey) 唯一（唯一索引是并发重复创建去重的最终仲裁）。
+  // nullable 容 T02 前既有行（升级脚本走 ALTER TABLE ADD COLUMN，无 NOT NULL 默认可给）；
+  // 应用层恒非空（Idempotency-Key 请求头必带，缺 → 90002）。
+  idempotencyKey String?
+
+  // T06 产物持久化（docs/autofigure/tickets/T06-artifact-persistence-png.md · grilling §6）：
+  // xml（文本）+ png（SQLite BLOB）+ evaluation（文本 JSON）仅在 Job 提交 succeeded 终态时
+  // 一并原子写入（runner persistSucceededWithArtifacts，T04 围栏保证 failed 后迟到成功不写）；
+  // queued/running/failed 恒 null。png 用 Prisma Bytes（= Uint8Array）。evaluation 是 Port 边界
+  // 已归一化的非敏感 JSON 载荷（T07 适配器负责从 raw 执行输出归一化；本行绝不落 raw provider/
+  // Python 响应/栈/凭证）。list/detail 公开投影不含本三列（下载契约：仅 owner 且仅 succeeded）。
+  xml        String? // 生成产物 XML（文本）
+  png        Bytes? // 生成产物 PNG（SQLite BLOB）
+  evaluation String? // 生成产物 evaluation（文本 JSON）
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  job GenerationJob? // 1:1（figureId @unique）
+
+  @@unique([ownerId, idempotencyKey])
+  @@index([ownerId])
+  @@map("figures")
+}
+
+// ---------------------------------------------------------------------------
+// GenerationJob —— AutoFigure 一次后台执行的持久化记录（docs/autofigure/spec.md §1-2）。
+// 本表只承载执行状态契约；状态机转换 / errorMessage 填充由 T03 runner 实现（T01 只建列）。
+// 状态值集（queued/running/succeeded/failed）来自 spec §2 已批准状态机，T01 仅落默认 queued。
+// ---------------------------------------------------------------------------
+enum GenerationJobStatus {
+  queued
+  running
+  succeeded
+  failed
+}
+
+model GenerationJob {
+  id      String   @id @default(cuid())
+  figure  Figure   @relation(fields: [figureId], references: [id], onDelete: Cascade)
+  figureId String @unique // 1:1 Figure ↔ Job（grilling §2：非为未来 1:N 预留）
+  status       GenerationJobStatus @default(queued)
+  errorMessage String? // 失败原因（非敏感）；runner 填充，T01 恒 null
+  startedAt    DateTime? // T03：原子领取（queued→running）时刻置位，恒在 running 期间非空
+  finishedAt   DateTime? // T03：终态（succeeded|failed）写入时刻置位；running/queued 恒 null
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@map("generation_jobs")
 }

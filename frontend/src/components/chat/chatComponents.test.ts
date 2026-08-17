@@ -1,7 +1,7 @@
 // seam: chat 展示组件哑测（#316 / #340 验收：props-in/emits-out 零逻辑，贴 FileTree 测试形态）。
 // 覆盖：ChatSidebar 容器/会话渲染 + emits；ChatComposer 输入 v-model + 发送禁用门 + slash-menu slot；
 // ChatMessageItem thinking/tool-line slot 透传 + 光标；ApprovalCard resolve emits + 已解决态；
-// ChatStream 合并时间线渲染 + 自动滚动（#400 范式 B + rAF 节流）。
+// ChatStream 消息流渲染 + 自动滚动（ADR 0014 审批卡撤离时间线；#400 范式 B + rAF 节流）。
 import { describe, expect, it, vi, afterEach } from 'vitest'
 import { mount } from '@vue/test-utils'
 import { nextTick, reactive } from 'vue'
@@ -143,7 +143,7 @@ describe('ChatMessageItem', () => {
     user.media.push({ type: 'image', mimeType: 'image/png', src: 'AA==' })
     const answer = newMsg('assistant', '完成'); answer.streaming = false
     const w = mount(ChatStream, {
-      props: { messages: [user, answer], approvals: [], anchorState: false, disconnected: false, historyHasMore: false, historyLoading: false },
+      props: { messages: [user, answer], historyHasMore: false, historyLoading: false },
     })
     expect(w.find('[data-test="regenerate"]').exists()).toBe(false)
   })
@@ -237,6 +237,89 @@ describe('ChatMessageItem', () => {
     expect(assistantBubbleRule).toContain('background: transparent')
     expect(userBubbleRule).toContain('background:')
   })
+
+  // ---- #568: 附件元数据呈现（image 尺寸/体积、audio 时长/体积、video 尺寸/时长、document 下载卡、url 形态）----
+  it('#568: image 附件带 width/height/sizeBytes → 元数据行显示尺寸与体积', () => {
+    const m = newMsg('assistant', '')
+    m.media.push({ type: 'image', mimeType: 'image/png', src: 'AAA', width: 1280, height: 720, sizeBytes: 2048 })
+    const w = mount(ChatMessageItem, { props: { msg: m } })
+    const meta = w.get('[data-test="media-meta"]')
+    expect(meta.text()).toContain('1280 × 720')
+    expect(meta.text()).toContain('2 KB')
+  })
+  it('#568: audio 附件带 durationMs/sizeBytes → 元数据行显示时长与体积', () => {
+    const m = newMsg('assistant', '')
+    m.media.push({ type: 'audio', mimeType: 'audio/mpeg', src: 'QUJD', durationMs: 150000, sizeBytes: 1024 })
+    const w = mount(ChatMessageItem, { props: { msg: m } })
+    const meta = w.get('[data-test="media-meta"]')
+    expect(meta.text()).toContain('2:30')
+    expect(meta.text()).toContain('1 KB')
+  })
+  it('#568: video 附件带 width/height/durationMs → 元数据行显示尺寸与时长', () => {
+    const m = newMsg('assistant', '')
+    m.media.push({ type: 'video', mimeType: 'video/mp4', src: 'REVG', width: 640, height: 360, durationMs: 60000 })
+    const w = mount(ChatMessageItem, { props: { msg: m } })
+    const meta = w.get('[data-test="media-meta"]')
+    expect(meta.text()).toContain('640 × 360')
+    expect(meta.text()).toContain('1:00')
+  })
+  it('#568: 无元数据的附件 → 不渲染元数据行（现状无差）', () => {
+    const m = newMsg('assistant', '')
+    m.media.push({ type: 'image', mimeType: 'image/png', src: 'AAA' })
+    const w = mount(ChatMessageItem, { props: { msg: m } })
+    expect(w.find('[data-test="media-meta"]').exists()).toBe(false)
+  })
+  it('#568: document 附件 → 下载链接卡（fileName + sizeBytes + dataURL href）', () => {
+    const m = newMsg('assistant', '请下载：')
+    m.media.push({ type: 'document', mimeType: 'application/pdf', src: 'JVBER', fileName: 'report.pdf', sizeBytes: 2048 })
+    const w = mount(ChatMessageItem, { props: { msg: m } })
+    const link = w.get('[data-test="media-document"]')
+    expect(link.text()).toContain('report.pdf')
+    expect(link.text()).toContain('2 KB')
+    expect(link.attributes('href')).toBe('data:application/pdf;base64,JVBER')
+    expect(link.attributes('download')).toBe('report.pdf')
+  })
+  it('#568: document 附件 label 优先于 fileName 展示', () => {
+    const m = newMsg('assistant', '')
+    m.media.push({ type: 'document', mimeType: 'application/pdf', src: 'JVBER', fileName: 'report.pdf', label: '研究报告', sizeBytes: 2048 })
+    const w = mount(ChatMessageItem, { props: { msg: m } })
+    expect(w.get('[data-test="media-document"]').text()).toContain('研究报告')
+  })
+  it('#568: url 形态附件 src 原样使用不拼 base64（mediaSrc http 分支）', () => {
+    const m = newMsg('assistant', '')
+    m.media.push({ type: 'image', mimeType: 'image/png', src: 'https://img.example.com/x.png' })
+    const w = mount(ChatMessageItem, { props: { msg: m } })
+    expect(w.get('[data-test="media-image"]').attributes('src')).toBe('https://img.example.com/x.png')
+  })
+  it('#568: url 形态 document → href 直用 url（不拼 base64），download 仍生效', () => {
+    const m = newMsg('assistant', '')
+    m.media.push({ type: 'document', mimeType: 'application/pdf', src: 'https://files.example.com/report.pdf', fileName: 'report.pdf' })
+    const w = mount(ChatMessageItem, { props: { msg: m } })
+    const link = w.get('[data-test="media-document"]')
+    expect(link.attributes('href')).toBe('https://files.example.com/report.pdf')
+    expect(link.attributes('download')).toBe('report.pdf')
+  })
+  // ---- #568 安全修复（security review）：document dataURL href mime 白名单 + mediaSrc scheme 防御 ----
+  it('#568(security): document 非白名单 mime（text/html / image/svg+xml）→ 不渲染下载卡（防下载脚本类文件）', () => {
+    const m = newMsg('assistant', '')
+    m.media.push({ type: 'document', mimeType: 'text/html', src: 'PGh0bWw+', fileName: 'x.html', sizeBytes: 100 })
+    m.media.push({ type: 'document', mimeType: 'image/svg+xml', src: 'PHN2Zz4=', fileName: 'x.svg', sizeBytes: 100 })
+    const w = mount(ChatMessageItem, { props: { msg: m } })
+    expect(w.find('[data-test="media-document"]').exists()).toBe(false)
+  })
+  it('#568(security): document 白名单 mime（application/pdf / text/plain）→ 渲染下载卡', () => {
+    const m = newMsg('assistant', '')
+    m.media.push({ type: 'document', mimeType: 'application/pdf', src: 'JVBER', fileName: 'a.pdf', sizeBytes: 100 })
+    m.media.push({ type: 'document', mimeType: 'text/plain', src: 'aGVsbG8=', fileName: 'b.txt', sizeBytes: 100 })
+    const w = mount(ChatMessageItem, { props: { msg: m } })
+    expect(w.findAll('[data-test="media-document"]').length).toBe(2)
+  })
+  it('#568(security): mediaSrc 对 javascript: scheme src 不原样透出（拼进 base64 段，解码失败不渲染）', () => {
+    const m = newMsg('assistant', '')
+    m.media.push({ type: 'image', mimeType: 'image/png', src: 'javascript:alert(1)' })
+    const w = mount(ChatMessageItem, { props: { msg: m } })
+    expect(w.get('[data-test="media-image"]').attributes('src')?.startsWith('data:image/png;base64,')).toBe(true)
+  })
 })
 
 describe('ToolLine', () => {
@@ -248,6 +331,72 @@ describe('ToolLine', () => {
     expect(details.attributes('open')).toBeUndefined()
     expect(w.get('[data-test="tool-detail"]').text()).toContain('echo ok')
     expect(w.get('[data-test="tool-detail"]').text()).toContain('ok')
+  })
+
+  it('#555: command rows show the unwrapped command as the summary main text', () => {
+    const m = newMsg('assistant', '')
+    m.tools.push({ id: 't1', name: 'bash', state: 'done', title: null, input: { command: 'sh -lc "echo hi"' }, result: '' })
+    const w = mount(ChatMessageItem, { props: { msg: m } })
+    expect(w.get('[data-test="tool-line"] .t-name').text()).toBe('echo hi')
+  })
+
+  it('#555: read rows show basename bold + directory dimmed', () => {
+    const m = newMsg('assistant', '')
+    m.tools.push({ id: 't1', name: 'read', state: 'done', title: null, input: { file_path: '/repo/src/util.ts' }, result: '' })
+    const w = mount(ChatMessageItem, { props: { msg: m } })
+    expect(w.get('[data-test="tool-line"] .t-name').text()).toBe('util.ts')
+    expect(w.get('[data-test="tool-line"] .t-args').text()).toBe('/repo/src')
+  })
+
+  it('#555: edit rows render an inline diff with stat when result carries details.diff', () => {
+    const m = newMsg('assistant', '')
+    m.tools.push({
+      id: 't1', name: 'edit', state: 'done', title: null,
+      input: { file_path: '/repo/a.ts' },
+      result: { diff: '+457 foo\n-455 bar\n' },
+    })
+    const w = mount(ChatMessageItem, { props: { msg: m } })
+    expect(w.get('[data-test="tool-diff"]').text()).toContain('foo')
+    expect(w.get('[data-test="tool-diff"]').text()).toContain('bar')
+    expect(w.get('[data-test="tool-stat"]').text()).toContain('+1')
+    expect(w.get('[data-test="tool-stat"]').text()).toContain('−1')
+  })
+})
+
+// #555:聚合摘要(>=2 个工具调用折叠为一条摘要,展开逐行;单工具调用直接渲染)
+describe('ToolGroup', () => {
+  it('aggregates 2+ tool calls into a collapsed summary row', () => {
+    const m = newMsg('assistant', '')
+    m.tools.push({ id: 't1', name: 'bash', state: 'done', title: null, input: { command: 'ls' }, result: '' })
+    m.tools.push({ id: 't2', name: 'bash', state: 'done', title: null, input: { command: 'pwd' }, result: '' })
+    m.tools.push({ id: 't3', name: 'read', state: 'error', title: null, input: { path: '/repo/a.ts' }, result: '' })
+    const w = mount(ChatMessageItem, { props: { msg: m } })
+    const group = w.get('details[data-test="tool-group"]')
+    expect(group.attributes('open')).toBeUndefined()
+    expect(w.get('[data-test="tool-group-summary"]').text()).toBe('Ran 2 commands, read a file · 1 failed')
+    expect(w.findAll('[data-test="tool-line"]')).toHaveLength(3)
+  })
+
+  it('keeps single tool calls ungrouped (direct ToolLine row)', () => {
+    const m = newMsg('assistant', '')
+    m.tools.push({ id: 't1', name: 'bash', state: 'done', title: null, input: { command: 'ls' }, result: '' })
+    const w = mount(ChatMessageItem, { props: { msg: m } })
+    expect(w.find('[data-test="tool-group"]').exists()).toBe(false)
+    expect(w.findAll('[data-test="tool-line"]')).toHaveLength(1)
+  })
+
+  it('aggregation keeps tool-line slot passthrough per row', async () => {
+    const m = newMsg('assistant', '')
+    m.tools.push({ id: 't1', name: 'bash', state: 'done', title: null, input: { command: 'ls' }, result: '' })
+    m.tools.push({ id: 't2', name: 'bash', state: 'done', title: null, input: { command: 'pwd' }, result: '' })
+    const w = mount(ChatMessageItem, {
+      props: { msg: m },
+      slots: {
+        'tool-line': ({ tool }: { tool: Msg['tools'][number] }) => `custom:${tool.id}`,
+      },
+    })
+    expect(w.text()).toContain('custom:t1')
+    expect(w.text()).toContain('custom:t2')
   })
 })
 
@@ -362,125 +511,6 @@ describe('ApprovalDock', () => {
   })
 })
 
-describe('ChatStream 合并时间线渲染（ADR 0009 / #399）', () => {
-  // 按渲染顺序提取根元素下可直接寻址的条目 data-test（气泡 data-test 由 msg-item slot 注入）
-  const tests: Array<{ name: string; messages: Msg[]; approvals: ApprovalItem[]; expected: string[] }> = [
-    {
-      name: '已落定回答 + 审批卡 → 卡插在回答之前',
-      messages: (() => {
-        const m = newMsg('assistant', '回答')
-        m.streaming = false
-        return [newMsg('user', 'hi'), m]
-      })(),
-      approvals: [{ ...card, seq: 1 }],
-      expected: ['msg', 'approval-a1', 'msg'],
-    },
-    {
-      name: '流式占位 → 审批卡插在占位之前（强制沉底）',
-      messages: [newMsg('user', 'hi'), newMsg('assistant')], // 末条 streaming=true
-      approvals: [{ ...card, seq: 2 }],
-      expected: ['msg', 'approval-a1', 'msg'],
-    },
-    {
-      name: '无 assistant → 审批卡插末尾',
-      messages: [newMsg('user', 'hi')],
-      approvals: [{ ...card, seq: 1 }],
-      expected: ['msg', 'approval-a1'],
-    },
-    {
-      name: '多卡插在同一锚点（最后一条已落定气泡前），卡间按 seq 序',
-      messages: (() => {
-        const m = newMsg('assistant', '回答一')
-        m.streaming = false
-        const m2 = newMsg('assistant', '回答二')
-        m2.streaming = false
-        return [m, m2]
-      })(),
-      approvals: [
-        { ...card, id: 'a2', seq: 2 }, // 故意乱序传入：渲染按 seq 排序
-        { ...card, id: 'a1', seq: 1 },
-      ],
-      expected: ['msg', 'approval-a1', 'approval-a2', 'msg'],
-    },
-  ]
-  for (const t of tests) {
-    it(`${t.name}：data-test 序列 ${t.expected.join('→')}`, () => {
-      const w = mount(ChatStream, {
-        props: {
-          messages: t.messages,
-          approvals: t.approvals,
-          anchorState: false,
-          disconnected: false,
-          historyHasMore: false,
-          historyLoading: false,
-        },
-        slots: { 'msg-item': `<div data-test="msg"></div>` },
-      })
-      const seq = w
-        .findAll('.stream > *')
-        .map((el) => el.attributes('data-test'))
-        .filter(Boolean)
-      expect(seq).toEqual(t.expected)
-    })
-  }
-
-  // #405-T2（#407）：anchorState —— 无 assistant 消息时合成虚拟气泡承载审批卡
-  const anchorTests: Array<{ name: string; messages: Msg[]; approvals: ApprovalItem[]; anchorState: boolean; expected: string[] }> = [
-    {
-      name: '无 assistant 消息 + anchorState=true → 合成虚拟气泡承载审批卡（卡在锚后）',
-      messages: [newMsg('user', 'hi')],
-      approvals: [{ ...card, seq: 1 }],
-      anchorState: true,
-      expected: ['msg', 'synthetic-anchor', 'approval-a1'],
-    },
-    {
-      name: '无 assistant 消息 + anchorState=false → 不合成，卡直接插末尾',
-      messages: [newMsg('user', 'hi')],
-      approvals: [{ ...card, seq: 1 }],
-      anchorState: false,
-      expected: ['msg', 'approval-a1'],
-    },
-    {
-      name: '有已落定 assistant 气泡 + anchorState=true → 不合成虚拟气泡',
-      messages: (() => {
-        const m = newMsg('assistant', '回答')
-        m.streaming = false
-        return [newMsg('user', 'hi'), m]
-      })(),
-      approvals: [{ ...card, seq: 1 }],
-      anchorState: true,
-      expected: ['msg', 'approval-a1', 'msg'],
-    },
-    {
-      name: '无 assistant 消息 + anchorState=true + 卡全 resolved → 虚拟气泡仍留存',
-      messages: [newMsg('user', 'hi')],
-      approvals: [{ ...card, seq: 1, status: 'resolved', decision: 'allow-once' }],
-      anchorState: true,
-      expected: ['msg', 'synthetic-anchor', 'approval-a1'],
-    },
-  ]
-  for (const t of anchorTests) {
-    it(`${t.name}：data-test 序列 ${t.expected.join('→')}`, () => {
-      const w = mount(ChatStream, {
-        props: {
-          messages: t.messages,
-          approvals: t.approvals,
-          anchorState: t.anchorState,
-          disconnected: false,
-          historyHasMore: false,
-          historyLoading: false,
-        },
-        slots: { 'msg-item': `<div data-test="msg"></div>` },
-      })
-      const seq = w
-        .findAll('.stream > *')
-        .map((el) => el.attributes('data-test'))
-        .filter(Boolean)
-      expect(seq).toEqual(t.expected)
-    })
-  }
-})
-
 describe('ChatStream 自动滚动（ADR 0009 / #400 范式 B + rAF 节流）', () => {
   // 假滚动容器：jsdom 无布局引擎，scrollHeight/clientHeight 是只读 getter、scrollTop setter 是
   // noop（读写恒 0）——用 defineProperty stub 滚动几何 + 自定义存取器记录 scrollTop 赋值，
@@ -495,9 +525,6 @@ describe('ChatStream 自动滚动（ADR 0009 / #400 范式 B + rAF 节流）', (
     const w = mount(ChatStream, {
       props: {
         messages: [],
-        approvals: [],
-        anchorState: false,
-        disconnected: false,
         historyHasMore: false,
         historyLoading: false,
         ...props,
@@ -634,7 +661,8 @@ describe('ChatStream 自动滚动（ADR 0009 / #400 范式 B + rAF 节流）', (
     const w = mountStream()
     stubGeometry()
     userScrollTo(500)
-    await w.setProps({ disconnected: true })
+    // 非消息内容的状态更新（历史加载态翻转）——不改变 messages，不应触发「有新消息」
+    await w.setProps({ historyLoading: true })
     await tick()
     expect(w.find('[data-test="jump-bottom"]').text()).toBe('回到底部')
   })
@@ -666,37 +694,5 @@ describe('ChatStream 自动滚动（ADR 0009 / #400 范式 B + rAF 节流）', (
     expect(rafSpy).toHaveBeenCalledTimes(1)
     await tick()
     expect(stream.scrollTop).toBe(0) // 无内容可滚，scrollTop 恒 0（赋值被浏览器 clamp）
-  })
-
-  it('新审批卡插入 → 停留底部时滚到底', async () => {
-    vi.useFakeTimers()
-    const w = mountStream()
-    stubGeometry()
-    userScrollTo(892)
-    spyRaf()
-    await w.setProps({ approvals: [{ ...card, seq: 1 }] })
-    expect(rafSpy).toHaveBeenCalledTimes(1)
-    await tick()
-    expect(stream.scrollTop).toBe(900) // 滚到底 = scrollHeight - clientHeight（浏览器 clamp 后真实位置）
-  })
-
-  it('展开审批详情（detailOpen）不联动滚动跟随', async () => {
-    vi.useFakeTimers()
-    const w = mountStream()
-    stubGeometry()
-    userScrollTo(892)
-    spyRaf()
-    // 展开详情 = approval.detailOpen 状态变化——detailOpen 是审批卡内部状态（store 内 toggle），
-    // 不改变组件 props，Vue 不重渲染、onUpdated 不触发 → 不调度滚动（不联动，标准聊天 UX）
-    const a = { ...card, seq: 1 }
-    await w.setProps({ approvals: [a] })
-    await tick() // 该次 props 变更已随帧滚过一次
-    a.detailOpen = true // 直接改对象字段（等价 store toggle），不触发 props 变更
-    await tick()
-    expect(rafSpy).toHaveBeenCalledTimes(1) // detailOpen 变化不新增滚动调度
-    // 后续内容变化仍正常跟随——展开详情与跟随互不影响
-    await w.setProps({ messages: [newMsg('assistant', '新回答')] })
-    await tick()
-    expect(stream.scrollTop).toBe(900) // 滚到底 = scrollHeight - clientHeight（浏览器 clamp 后真实位置）
   })
 })
