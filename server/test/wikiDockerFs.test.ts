@@ -29,6 +29,7 @@ class FakeArchive implements FileArchive {
   calls: Array<{ method: ArchiveMethod; root: FileRoot; relPath: string; content?: string }> = []
   constructor(private readonly behave: Partial<Record<ArchiveMethod, (relPath: string) => Error | void>> = {}) {}
   async read(_name: string): Promise<never> { throw new Error('not used by DockerWikiFileSystem') }
+  async readBytes(): Promise<never> { throw new Error('not used by DockerWikiFileSystem') }
   async write(_name: string, root: FileRoot, relPath: string, content: string): Promise<void> {
     this.calls.push({ method: 'write', root, relPath, content })
     const e = this.behave.write?.(relPath)

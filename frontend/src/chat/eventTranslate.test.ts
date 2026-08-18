@@ -444,6 +444,81 @@ describe('ChatEventTranslator', () => {
     ])
   })
 
+  // ---- Phase 2 图片显示修复：agent assistant 流 mediaUrls → attachment 帧 ----
+  // 实测校准（ghcr 2026.7.1-browser）：合法 MEDIA:<path> 输出时，assistant 流事件的 payload.data
+  // .mediaUrls 携带容器内 workspace 绝对路径数组（chat 事件 content 不携带媒体）。MediaBlock.src 存
+  // 绝对路径原样（消费端 useChatConnection 识别 WORKSPACE_ABS_PREFIX 后经受保护 files/raw 端点 resolve
+  // 成 blob URL）。扩展名白名单 png/jpg/jpeg/webp/gif；未知扩展名不产块（无 image/* fallback）。
+  it('assistant 流带 mediaUrls → attachment 帧（src 存容器绝对路径原样）', () => {
+    const t = makeTranslator()
+    const png = '/home/node/.openclaw/workspace/test.png'
+    expect(t.translate({ type: 'event', event: 'agent', payload: { runId: 'r1', stream: 'assistant', data: { mediaUrls: [png] } } })).toEqual([
+      { type: 'attachment', runId: 'r1', media: [{ type: 'image', mimeType: 'image/png', src: png }] },
+    ])
+  })
+
+  it('png/jpg/jpeg/webp/gif → 各产对应 mime（扩展名大小写宽容）', () => {
+    const t = makeTranslator()
+    const W = '/home/node/.openclaw/workspace/'
+    expect(
+      t.translate({ type: 'event', event: 'agent', payload: { runId: 'r1', stream: 'assistant', data: { mediaUrls: [`${W}a.png`, `${W}b.jpg`, `${W}c.JPEG`, `${W}d.webp`, `${W}e.GIF`] } } }),
+    ).toEqual([
+      {
+        type: 'attachment',
+        runId: 'r1',
+        media: [
+          { type: 'image', mimeType: 'image/png', src: `${W}a.png` },
+          { type: 'image', mimeType: 'image/jpeg', src: `${W}b.jpg` },
+          { type: 'image', mimeType: 'image/jpeg', src: `${W}c.JPEG` },
+          { type: 'image', mimeType: 'image/webp', src: `${W}d.webp` },
+          { type: 'image', mimeType: 'image/gif', src: `${W}e.GIF` },
+        ],
+      },
+    ])
+  })
+
+  it('未知扩展名（txt/pdf/无扩展名）→ 不产块（不显示，无 image/* fallback）', () => {
+    const t = makeTranslator()
+    const W = '/home/node/.openclaw/workspace/'
+    expect(
+      t.translate({ type: 'event', event: 'agent', payload: { runId: 'r1', stream: 'assistant', data: { mediaUrls: [`${W}log.txt`, `${W}doc.pdf`, `${W}noext`] } } }),
+    ).toEqual([])
+    // 混合有效/无效 → 只保留白名单内
+    expect(
+      t.translate({ type: 'event', event: 'agent', payload: { runId: 'r1', stream: 'assistant', data: { mediaUrls: [`${W}bad.txt`, `${W}good.png`] } } }),
+    ).toEqual([
+      { type: 'attachment', runId: 'r1', media: [{ type: 'image', mimeType: 'image/png', src: `${W}good.png` }] },
+    ])
+  })
+
+  it('mediaUrls 非数组/空数组/元素非 string → []（0 信任），混入非 string 元素时跳过该元素', () => {
+    const t = makeTranslator()
+    const W = '/home/node/.openclaw/workspace/'
+    expect(t.translate({ type: 'event', event: 'agent', payload: { runId: 'r1', stream: 'assistant', data: { mediaUrls: 'not-array' } } })).toEqual([])
+    expect(t.translate({ type: 'event', event: 'agent', payload: { runId: 'r1', stream: 'assistant', data: { mediaUrls: [] } } })).toEqual([])
+    expect(t.translate({ type: 'event', event: 'agent', payload: { runId: 'r1', stream: 'assistant', data: { mediaUrls: [42, null, {}] } } })).toEqual([])
+    expect(
+      t.translate({ type: 'event', event: 'agent', payload: { runId: 'r1', stream: 'assistant', data: { mediaUrls: [`${W}a.png`, 42] } } }),
+    ).toEqual([
+      { type: 'attachment', runId: 'r1', media: [{ type: 'image', mimeType: 'image/png', src: `${W}a.png` }] },
+    ])
+  })
+
+  it('缺 runId → []（attachment 帧须挂 runId 锚定）', () => {
+    const t = makeTranslator()
+    const frame = { type: 'event', event: 'agent', payload: { runId: 'r1', stream: 'assistant', data: { mediaUrls: ['/home/node/.openclaw/workspace/a.png'] } } }
+    delete (frame.payload as Record<string, unknown>).runId
+    expect(t.translate(frame)).toEqual([])
+  })
+
+  it('tool stream 仍走 translateTool；其他未知 stream → []（assistant 分支不劫持既有路径）', () => {
+    const t = makeTranslator()
+    expect(t.translate(agentTool('start', { name: 'bash', toolCallId: 'c1' }))).toEqual([
+      { type: 'tool', runId: 'r1', name: 'bash', state: 'running', id: 'c1', title: null, input: null, result: null, isError: false },
+    ])
+    expect(t.translate({ type: 'event', event: 'agent', payload: { runId: 'r1', stream: 'item', data: { mediaUrls: ['/x.png'] } } })).toEqual([])
+  })
+
   // ---- T08 工具 ----
   it('tool start → running 帧（data.name/toolCallId/args → name/id/input）', () => {
     const t = makeTranslator()

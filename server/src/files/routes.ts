@@ -16,7 +16,16 @@ import { getInstanceForUser } from '../containers/orchestrator'
 import { CONTAINER_NAME_REGEX } from '../validation/schemas'
 import type { FileArchive } from './fsPort'
 import { FileExists, FileInvalidPath, FileNotFound } from './errors'
-import { parseFileWriteBody, requireFilePath, requireFileRoot } from './paths'
+import { parseFileWriteBody, requireFilePath, requireFileRoot, resolveWorkspaceAbsPath } from './paths'
+
+// WebChat 媒体白名单（files/raw 端点）：仅图片扩展名 → mime。未知扩展名 → 90002（前端也不渲染）。
+const MEDIA_MIME_BY_EXT: Record<string, string> = {
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  webp: 'image/webp',
+  gif: 'image/gif',
+}
 
 export interface FilesRouterDeps {
   // FileArchive Port（#589 新接缝）：生产 DockerFileArchive（getArchive/putArchive/exec rm），
@@ -60,6 +69,28 @@ export function createFilesRouter(deps: FilesRouterDeps): Router {
       ok(res, await archive.read(inst.name, root, relPath, recursive))
     } catch (err) {
       assertFileOpError(err)
+    }
+  })
+
+  // GET /:name/files/raw?path=<workspace 绝对路径> —— WebChat 媒体字节端点（Phase 2 图片显示修复）。
+  // agent mediaUrls 携带容器内绝对路径（如 /home/node/.openclaw/workspace/test.png）；本端点只接受
+  // workspace 树根前缀内路径（resolveWorkspaceAbsPath：前缀 + 穿越防护），按扩展名白名单 → mime，
+  // 成功路径豁免 #312 信封直发原生字节（对齐 figures /figures/:id/png 先例：浏览器经带 JWT 的
+  // apiFetch→blob→objectURL 消费，<img> 直连带不了 Authorization header）。错误面仍走信封。
+  router.get('/:name/files/raw', async (req: Request, res: Response) => {
+    const inst = await resolveInstance(req, req.params.name) // 容器/归属门（20040 同码防探测）
+    const abs = resolveWorkspaceAbsPath(req.query.path) // 非 workspace 前缀/穿越 → 90002(data.path)
+    if (!abs.ok) throw fail(CODE.VALIDATION_FAILED, undefined, { path: abs.errors })
+    const ext = abs.path.split('.').pop()?.toLowerCase() ?? ''
+    const mime = MEDIA_MIME_BY_EXT[ext]
+    if (!mime) throw fail(CODE.VALIDATION_FAILED, undefined, { path: ['仅支持 png/jpg/jpeg/webp/gif 图片'] })
+    try {
+      const bytes = await archive.readBytes(inst.name, 'workspace', abs.path)
+      res.set('Content-Type', mime)
+      res.set('Cache-Control', 'no-store') // 工作区图片可变，不缓存
+      res.send(bytes)
+    } catch (err) {
+      assertFileOpError(err) // FileNotFound → 60040；FileInvalidPath → 90002
     }
   })
 

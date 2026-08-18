@@ -51,6 +51,16 @@ class FakeFileArchive implements FileArchive {
     throw new FileNotFound(relPath)
   }
 
+  // files/raw 字节通道：直接返回文件原始字节（不做 NUL 嗅探/UTF-8 转码——媒体字节透传语义，
+  // 与 read() 的「二进制 → content:null」互补）。不存在 → FileNotFound；指向目录 → FileInvalidPath。
+  async readBytes(_name: string, root: FileRoot, relPath: string): Promise<Buffer> {
+    this.calls.push({ method: 'readBytes', root, relPath })
+    if (this.dirs.has(relPath)) throw new FileInvalidPath(relPath)
+    const raw = this.files.get(relPath)
+    if (raw === undefined) throw new FileNotFound(relPath)
+    return Buffer.from(raw, 'utf8')
+  }
+
   async write(_name: string, root: FileRoot, relPath: string, content: string): Promise<void> {
     this.calls.push({ method: 'write', root, relPath, content })
     if (!this.files.has(relPath)) throw new FileNotFound(relPath)
@@ -335,5 +345,76 @@ describe('files REST（接缝 #2 信封 + #589）', () => {
       .send({ root: 'wiki', path: 'a.md' })
     expect(res.body.code).toBe(90002)
     expect(res.body.data).toHaveProperty('content')
+  })
+
+  // ---------------------------- GET /:name/files/raw（WebChat 媒体字节通道）----------------------------
+
+  it('raw png 成功读取：原生字节 + image/png + 无信封', async () => {
+    const u = await seedUser(ctx.prisma, 'fraw1', 'pw-fraw1-secure')
+    const name = await seedContainer(u.id)
+    const l = await login(ctx.request, 'fraw1', 'pw-fraw1-secure')
+    archive.files.set('test.png', 'PNG\r\n\nfake-png-bytes')
+    const res = await ctx.request
+      .get(`${BASE}/${name}/files/raw?path=${encodeURIComponent('/home/node/.openclaw/workspace/test.png')}`)
+      .set(bearer(l.access))
+    expect(res.status).toBe(200)
+    expect(res.headers['content-type']).toBe('image/png')
+    expect(res.body).not.toHaveProperty('code') // 豁免信封：原生字节
+    // supertest 默认 JSON 解析 body；字节经 Buffer 判定
+    expect(archive.calls.at(-1)).toMatchObject({ method: 'readBytes', root: 'workspace', relPath: 'test.png' })
+  })
+
+  it('raw 未认证 → 10001', async () => {
+    const u = await seedUser(ctx.prisma, 'fraw2', 'pw-fraw2-secure')
+    const name = await seedContainer(u.id)
+    const res = await ctx.request.get(`${BASE}/${name}/files/raw?path=${encodeURIComponent('/home/node/.openclaw/workspace/x.png')}`)
+    expect(res.body.code).toBe(10001)
+  })
+
+  it('raw 越权访问他人容器 → 20040（防探测同码）', async () => {
+    const u = await seedUser(ctx.prisma, 'fraw3', 'pw-fraw3-secure')
+    const name = await seedContainer(u.id)
+    await seedUser(ctx.prisma, 'fraw3v', 'pw-fraw3v-secure')
+    const lv = await login(ctx.request, 'fraw3v', 'pw-fraw3v-secure')
+    const res = await ctx.request.get(`${BASE}/${name}/files/raw?path=${encodeURIComponent('/home/node/.openclaw/workspace/x.png')}`).set(bearer(lv.access))
+    expect(res.body.code).toBe(20040)
+  })
+
+  it('raw 越界路径（.. 穿越 / 绝对路径越出 workspace）→ 90002 + data.path', async () => {
+    const u = await seedUser(ctx.prisma, 'fraw4', 'pw-fraw4-secure')
+    const name = await seedContainer(u.id)
+    const l = await login(ctx.request, 'fraw4', 'pw-fraw4-secure')
+    for (const bad of [
+      '/home/node/.openclaw/workspace/../secret.png', // 前缀内穿越
+      '/home/node/.openclaw/wiki/main/x.png', // 非 workspace 树
+      '/etc/passwd', // 任意绝对路径
+      '/home/node/.openclaw/workspace/a\\b.png', // 反斜杠
+    ]) {
+      const res = await ctx.request.get(`${BASE}/${name}/files/raw?path=${encodeURIComponent(bad)}`).set(bearer(l.access))
+      expect(res.body.code).toBe(90002)
+      expect(res.body.data).toHaveProperty('path')
+    }
+  })
+
+  it('raw 未知扩展名 → 90002（媒体白名单外）', async () => {
+    const u = await seedUser(ctx.prisma, 'fraw5', 'pw-fraw5-secure')
+    const name = await seedContainer(u.id)
+    const l = await login(ctx.request, 'fraw5', 'pw-fraw5-secure')
+    archive.files.set('doc.pdf', '%PDF-fake')
+    const res = await ctx.request
+      .get(`${BASE}/${name}/files/raw?path=${encodeURIComponent('/home/node/.openclaw/workspace/doc.pdf')}`)
+      .set(bearer(l.access))
+    expect(res.body.code).toBe(90002)
+    expect(res.body.data).toHaveProperty('path')
+  })
+
+  it('raw 文件不存在 → 60040', async () => {
+    const u = await seedUser(ctx.prisma, 'fraw6', 'pw-fraw6-secure')
+    const name = await seedContainer(u.id)
+    const l = await login(ctx.request, 'fraw6', 'pw-fraw6-secure')
+    const res = await ctx.request
+      .get(`${BASE}/${name}/files/raw?path=${encodeURIComponent('/home/node/.openclaw/workspace/missing.png')}`)
+      .set(bearer(l.access))
+    expect(res.body.code).toBe(60040)
   })
 })

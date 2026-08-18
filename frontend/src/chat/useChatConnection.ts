@@ -8,7 +8,7 @@ import { getBootstrapToken } from '@/api/chat'
 import { useAuthStore, isTokenExpired } from '@/stores/auth'
 import { useChatStore, newMsg, type Msg, type ApprovalItem, type ToolRow } from '@/stores/chat'
 import { useFileTabsStore } from '@/stores/fileTabs'
-import { ApiError } from '@/api/client'
+import { ApiError, apiFetch } from '@/api/client'
 import {
   createGatewayChat,
   createRequestId,
@@ -46,6 +46,13 @@ const RESUME_WAIT_MS = 30_000
 const CONNECT_TIMEOUT_MS = 15_000
 const INITIAL_HISTORY_LIMIT = 50
 
+// Phase 2 图片显示修复：agent mediaUrls 的容器内 workspace 绝对路径前缀。与 server files/routes.ts
+// FILE_ROOTS.workspace = ${HOME_BIND}/workspace = /home/node/.openclaw/workspace 严格对齐——以此前缀
+// 开头的 MediaBlock.src 是「待 resolve 的容器媒体」（经受保护 files/raw 端点取字节→blob URL）；
+// 其余（http/https/data:/blob:/base64 历史附件）原样透传。前缀由 server resolveWorkspaceAbsPath
+// 二次复检（越界/穿越 → 90002），前端识别失败最坏为静默丢弃，不会误读任意容器文件。
+const WORKSPACE_ABS_PREFIX = '/home/node/.openclaw/workspace/'
+
 export function useChatConnection(status: ChatStatus) {
   const chat = useChatStore()
   const fileTabs = useFileTabsStore()
@@ -53,6 +60,14 @@ export function useChatConnection(status: ChatStatus) {
   // #564: outbox 离线待发队列（sessionStorage 窄窗落盘）——「已点发送但网关还没回执」的消息
   // 刷新/重连后自动重发。工厂默认取全局 sessionStorage；scope = 容器+会话。
   const outbox = createOutboxStore()
+  // Phase 2 图片显示修复：媒体 objectURL 生命周期管理。liveObjectUrls 追踪所有 fetchMediaObjectUrl
+  // 创建的 objectURL（切会话/切容器/卸载时 revokeAllObjectUrls 统一释放，防泄漏——blob URL 在浏览器
+  // 生命周期内不自动回收，不 revoke 每次会话图片都累积占用内存）。resolvedMediaPaths 按 runId 记录
+  // 已挂载过的容器绝对路径（agent assistant 流可能多次携带相同 mediaUrls——每次文本增量重发→同图去重；
+  // 记原始路径而非 blob URL，因每次 createObjectURL 生成的 URL 都不同、resolve 后无法比对去重）。
+  // 生命周期与 liveObjectUrls 同界：revokeAllObjectUrls 一并清空（run 终态后可残留，reset 兜底有界）。
+  const liveObjectUrls = new Set<string>()
+  const resolvedMediaPaths = new Map<string, Set<string>>()
 
   // 连接生命周期态（本属连接簇）：意外断线禁用发送、提示重连（codex P2 #4）；onReady/onClose 维护
   const disconnected = ref(false)
@@ -263,6 +278,67 @@ export function useChatConnection(status: ChatStatus) {
       clearResumeWait() // B5: 本 run 媒体续帧到达 → 取消 resume 超时重建（同 handleText）
       last.media.push(...media)
     }
+  }
+
+  // Phase 2 图片显示修复：attachment 帧媒体源为容器内 workspace 绝对路径（agent assistant 流
+  // mediaUrls，经 eventTranslate 转 MediaBlock，如 /home/node/.openclaw/workspace/test.png）→ 经受
+  // 保护 files/raw 端点（apiFetch 带 JWT + 401 刷新链）取原始字节 → blob → objectURL 回填 src 后再
+  // handleAttachment 挂 store。原因：<img> 直连容器路径带不了 Authorization header，且不能直接 <img
+  // src="http://.../files/raw">（401 拒绝）；blob URL 是浏览器端标准消费形态。非容器路径
+  // （http/https/data:/blob:/base64 历史附件）原样透传，不动既有图片/音频/视频/文档附件路径。
+  // 失败/无权限/非白名单扩展名 → 静默丢弃该块（0 信任，不占位符、不报错打断会话）。
+  // gen/session 守卫：await 期间切会话/容器则丢弃过期 resolve（对齐 loadHistory stale 守卫语义）。
+  // 防重：同 run 已挂载过的容器路径（agent 增量重发 mediaUrls）跳过，避免同图重复渲染。
+  async function resolveAttachment(runId: string, media: MediaBlock[]): Promise<void> {
+    const gen = containerGen
+    const sessionKey = chat.selectedSession
+    const container = chat.selectedContainer
+    if (!container || !sessionKey) return
+    let seen = resolvedMediaPaths.get(runId)
+    if (!seen) {
+      seen = new Set()
+      resolvedMediaPaths.set(runId, seen)
+    }
+    const resolved: MediaBlock[] = []
+    for (const m of media) {
+      if (!m.src.startsWith(WORKSPACE_ABS_PREFIX)) {
+        resolved.push(m) // 非容器媒体：原样透传（base64/http/data:/blob: 历史附件、发送 echo）
+        continue
+      }
+      if (seen.has(m.src)) continue // 已挂载过该路径：agent 重发去重
+      const url = await fetchMediaObjectUrl(container, m.src)
+      if (url) {
+        seen.add(m.src)
+        resolved.push({ ...m, src: url })
+      }
+    }
+    if (gen !== containerGen || chat.selectedSession !== sessionKey) return // 切走了：丢弃过期 resolve
+    if (resolved.length === 0) return
+    handleAttachment(runId, resolved) // claimRun 守卫在内部二次确认（abandoned/foreign/孤儿）
+  }
+
+  // 经 files/raw 端点取容器内 workspace 图片字节 → blob → objectURL。任何失败（网络/校验 90002/
+  // 越权 20040/不存在 60040/未知扩展名）→ null（消费端静默丢弃该媒体块）。objectURL 记入
+  // liveObjectUrls，随 revokeAllObjectUrls（reset/dispose）统一释放。
+  async function fetchMediaObjectUrl(container: string, absPath: string): Promise<string | null> {
+    try {
+      const resp = await apiFetch(`/api/v1/containers/${container}/files/raw?path=${encodeURIComponent(absPath)}`)
+      if (!resp.ok) return null
+      const blob = await resp.blob()
+      const url = URL.createObjectURL(blob)
+      liveObjectUrls.add(url)
+      return url
+    } catch {
+      return null // 0 信任：任何异常静默丢弃（不打断会话、不占位符）
+    }
+  }
+
+  // 释放全部已追踪 objectURL + 防重记录（切会话/切容器/卸载前调用——消息投影即将清空，objectURL
+  // 无消费者，浏览器端可安全 revoke）。与 chatStore reset 调用点成对出现。
+  function revokeAllObjectUrls(): void {
+    for (const url of liveObjectUrls) URL.revokeObjectURL(url)
+    liveObjectUrls.clear()
+    resolvedMediaPaths.clear()
   }
 
   // #565: done 帧可携带 thinking——final 相等/thinking-only 场景（翻译层未产 text 帧）的结构化
@@ -616,7 +692,10 @@ export function useChatConnection(status: ChatStatus) {
               handleText(frame.runId, frame.delta, frame.replace, frame.thinking)
               break
             case 'attachment': // #459-T3 #464：附件媒体帧（image/audio/video 块）
-              handleAttachment(frame.runId, frame.media)
+              // Phase 2 图片显示修复：agent assistant 流 mediaUrls（容器绝对路径）先异步 resolve 成
+              // blob URL 再挂 store（<img> 直连带不了 Authorization header）；既有 base64/http 媒体
+              // 原样透传。resolve 为 fire-and-forget（不阻塞 ws 帧处理），失败静默丢弃。
+              void resolveAttachment(frame.runId, frame.media)
               break
             case 'done':
               handleDone(frame.runId, frame.thinking, frame.message)
@@ -788,6 +867,7 @@ export function useChatConnection(status: ChatStatus) {
     oldGw?.stop()
     status.onConnecting(true)
     disconnected.value = false
+    revokeAllObjectUrls() // Phase 2：切容器前释放旧容器媒体 objectURL（消息投影即将清空）
     chat.resetForContainer()
     fileTabs.reset() // #626 T1：切容器清文件 tab + workspace 树（下次进「文件」分段重拉）
     abandonActiveRun()
@@ -974,6 +1054,7 @@ export function useChatConnection(status: ChatStatus) {
     const gen = containerGen
     const hgen = ++historyGen // codex #249 P2：本请求代；之后再有 loadHistory 即取代本请求
     if (!gateway) return // E2: 断线不重载（防先清空 transcript 再 RPC 失败留白）
+    revokeAllObjectUrls() // Phase 2：重置消息投影前释放已追踪 objectURL（旧消息图片即将清空）
     chat.resetForSession()
     fileTabs.closeAll() // #626 T1：切会话清文件 tab（workspace 树是 per-container，保留）
     chat.setHistoryLoading(true)
@@ -1135,6 +1216,7 @@ export function useChatConnection(status: ChatStatus) {
     chat.removeSession(key)
     if (chat.selectedSession === key) {
       chat.setSelectedSession('')
+      revokeAllObjectUrls() // Phase 2：删除当前会话前释放其媒体 objectURL（消息投影即将清空）
       chat.resetForSession() // 清空消息投影 → 空聊天区（不再自动切到剩余首个或新建）
       fileTabs.closeAll() // #626 T1：删当前会话=离开会话，清文件 tab（workspace 树保留）
       status.onClearError() // 删除当前会话后清残留错误条（spec #461：错误呈现统一走 toast，不留双通道）
@@ -1145,6 +1227,7 @@ export function useChatConnection(status: ChatStatus) {
   // 切容器/断线/卸载清理
   function dispose() {
     disposed = true
+    revokeAllObjectUrls() // Phase 2：卸载释放全部媒体 objectURL（组件销毁，blob URL 无消费者）
     clearPendingGraceTimer() // B4: 卸载清延迟收尾 timer，防组件销毁后触发
     clearResumeWait() // B5: 卸载清 resume 等待 timer
     // #14: 连接期超时 timer 已收 openGateway 局部作用域（P0：闭包内 clearTimeout，并发 openGateway

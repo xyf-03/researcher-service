@@ -48,6 +48,10 @@ const APPROVAL_RESOLVED_EVENTS = ['exec.approval.resolved', 'plugin.approval.res
 // 工具事件（实测校准：event:'agent' + payload.stream:'tool' + payload.data.phase）
 const TOOL_AGENT_EVENT = 'agent'
 const TOOL_STREAM = 'tool'
+// Phase 2 图片显示修复：agent 事件里文本流式回复的 stream 值（实测校准 ghcr 2026.7.1-browser——
+// 合法 MEDIA:<path> 输出时，payload.stream === 'assistant' 的 payload.data.mediaUrls 携带容器内
+// workspace 绝对路径数组；chat 事件 content 不携带媒体，仅此通道可读 agent 图片产物）
+const TOOL_ASSISTANT_STREAM = 'assistant'
 
 // delta state 下增量字段；replace=true + message 快照时改发 replace 帧（整段替换）
 const DELTA_TEXT = 'deltaText'
@@ -240,6 +244,26 @@ export function attachmentToMediaBlock(a: {
   }
 }
 
+// ---- Phase 2 图片显示修复：agent assistant 流 mediaUrls → MediaBlock ----
+// 扩展名白名单与 server files/routes.ts MEDIA_MIME_BY_EXT 对齐：png/jpg/jpeg/webp/gif → image/*。
+// 未知扩展名 → null（不显示；不用 image/* fallback——容器内容不可猜测，白名单即安全边界）。
+const MEDIA_MIME_BY_EXT: Record<string, { type: 'image'; mimeType: string }> = {
+  png: { type: 'image', mimeType: 'image/png' },
+  jpg: { type: 'image', mimeType: 'image/jpeg' },
+  jpeg: { type: 'image', mimeType: 'image/jpeg' },
+  webp: { type: 'image', mimeType: 'image/webp' },
+  gif: { type: 'image', mimeType: 'image/gif' },
+}
+
+// 容器内绝对路径 → MediaBlock。src 存绝对路径原样（如 /home/node/.openclaw/workspace/test.png），
+// 由消费端（useChatConnection）识别 WORKSPACE_ABS_PREFIX 前缀后经受保护 files/raw 端点取字节。
+function mediaUrlToMediaBlock(url: string): MediaBlock | null {
+  const ext = url.split('.').pop()?.toLowerCase() ?? ''
+  const spec = MEDIA_MIME_BY_EXT[ext]
+  if (!spec) return null
+  return { type: spec.type, mimeType: spec.mimeType, src: url }
+}
+
 // #560: SDK SessionProjection 减负——翻译层经注入的归约器读「归一化后的 run 终态」，不再手写
 // 判 payload。归约器接口刻意收窄为翻译层所需：终态 status（aborted/error/timeout/yielded/
 // completed）、终态权威 message（errorMessage 已 readNonemptyString 归一）、重放去重判定。
@@ -313,6 +337,10 @@ export class ChatEventTranslator {
     if (event === TOOL_AGENT_EVENT) {
       if (payload.stream === TOOL_STREAM) {
         return this.translateTool(payload, String((asRecord(payload.data).phase) ?? ''))
+      }
+      // Phase 2 图片显示修复：assistant 流文本增量带 mediaUrls（agent 图片产物）→ attachment 帧
+      if (payload.stream === TOOL_ASSISTANT_STREAM) {
+        return this.translateAssistantMedia(payload)
       }
       return []
     }
@@ -524,6 +552,27 @@ export class ChatEventTranslator {
       id: approvalId,
       decision: typeof payload.decision === 'string' ? payload.decision : '',
     }
+  }
+
+  // Phase 2 图片显示修复：agent assistant 流事件 payload → attachment 帧。payload.data.mediaUrls
+  // 是容器内绝对路径数组（0 信任：非 string/空 → 跳过）；mediaUrlToMediaBlock 按扩展名白名单过滤，
+  // 未知扩展名不产块（不显示，不用 image/* fallback——客户端不可猜测容器内容）。MediaBlock.src 存
+  // 容器绝对路径原样（消费端 useChatConnection 在进 store 前经 files/raw 端点异步 resolve 成 blob URL）。
+  // runId 缺失 → []（attachment 帧须挂 runId 锚定）；全无有效媒体 → []（不产空 attachment 帧）。
+  private translateAssistantMedia(payload: Record<string, unknown>): ChatFrame[] {
+    const runId = typeof payload.runId === 'string' ? payload.runId : ''
+    if (!runId) return []
+    const data = asRecord(payload.data)
+    const mediaUrls = data.mediaUrls
+    if (!Array.isArray(mediaUrls)) return []
+    const media: MediaBlock[] = []
+    for (const raw of mediaUrls) {
+      if (typeof raw !== 'string' || !raw) continue
+      const block = mediaUrlToMediaBlock(raw)
+      if (block) media.push(block)
+    }
+    if (media.length === 0) return []
+    return [{ type: 'attachment', runId, media }]
   }
 
   // 工具生命周期事件 payload → 工具帧。字段在 data 子对象下：name/toolCallId/args（start）、

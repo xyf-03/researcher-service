@@ -44,6 +44,10 @@ export interface FileArchive {
   // 路径不存在 → FileNotFound。symlink 根条目 → FileInvalidPath（不支持读链接）。
   // name = 面板实例名（已过路由层 CONTAINER_NAME_REGEX 校验；适配层转 docker 容器名）。
   read(name: string, root: FileRoot, relPath: string, recursive: boolean): Promise<DirListing | FileReading>
+  // 原始字节读取（WebChat 媒体通道，files/raw 端点）：不经 NUL 嗅探/UTF-8 转码，返回文件原生
+  // Buffer——与 read() 的「二进制 → content:null」语义互补（read 面向文本投影，readBytes 面向
+  // 字节透传，如 workspace 图片）。超大（> MAX_FILE_READ_BYTES）/ 非文件条目 → FileInvalidPath。
+  readBytes(name: string, root: FileRoot, relPath: string): Promise<Buffer>
   // 覆写已存在文件（不存在 → FileNotFound）。写前幂等 start 容器（保 exec mkdir 可用）。
   write(name: string, root: FileRoot, relPath: string, content: string): Promise<void>
   // 新建文件（已存在 → FileExists）。

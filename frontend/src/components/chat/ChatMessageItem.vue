@@ -33,6 +33,9 @@ defineSlots<{
 // 兜底不信任外来 scheme）：http(s) 经 URL 解析校验后原样返回；data: 前缀原样返回；其余一律按纯
 // base64 重建 dataURL——非 http(s) 非 data: 的字符串绝不作为可执行 href 原样透出（被拼进 base64
 // 段，解码失败即不渲染）。
+// Phase 2 图片显示修复：blob: 前缀原样返回——此类 src 恒为 useChatConnection 经受保护 files/raw
+// 端点取字节后本页 URL.createObjectURL 自建（指向内存 blob，无外部注入面，非可执行 href），浏览器
+// 按 blob 自带的 image/* mime 渲染；若不识别而拼 base64，blob: 段解码失败即不渲染（图片丢失）。
 function isHttpUrl(s: string): boolean {
   try {
     const u = new URL(s)
@@ -44,6 +47,7 @@ function isHttpUrl(s: string): boolean {
 function mediaSrc(m: MediaBlock): string {
   if (isHttpUrl(m.src)) return m.src
   if (m.src.startsWith('data:')) return m.src
+  if (m.src.startsWith('blob:')) return m.src
   return `data:${m.mimeType};base64,${m.src}`
 }
 // #568 安全修复（security review）：document 下载卡 mime 白名单——base64 形态的 dataURL href 只对

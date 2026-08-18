@@ -291,6 +291,12 @@ describe('ChatMessageItem', () => {
     const w = mount(ChatMessageItem, { props: { msg: m } })
     expect(w.get('[data-test="media-image"]').attributes('src')).toBe('https://img.example.com/x.png')
   })
+  it('Phase 2: blob 形态附件 src 原样返回不拼 base64（agent 容器媒体经 files/raw resolve 的 objectURL）', () => {
+    const m = newMsg('assistant', '')
+    m.media.push({ type: 'image', mimeType: 'image/png', src: 'blob:http://localhost:5173/1234-5678' })
+    const w = mount(ChatMessageItem, { props: { msg: m } })
+    expect(w.get('[data-test="media-image"]').attributes('src')).toBe('blob:http://localhost:5173/1234-5678')
+  })
   it('#568: url 形态 document → href 直用 url（不拼 base64），download 仍生效', () => {
     const m = newMsg('assistant', '')
     m.media.push({ type: 'document', mimeType: 'application/pdf', src: 'https://files.example.com/report.pdf', fileName: 'report.pdf' })

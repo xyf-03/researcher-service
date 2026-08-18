@@ -42,6 +42,9 @@ class MemoryConfigArchive implements FileArchive {
   async read(): Promise<never> {
     throw new Error('files CRUD not used in models tests')
   }
+  async readBytes(): Promise<never> {
+    throw new Error('files CRUD not used in models tests')
+  }
   async write(): Promise<never> {
     throw new Error('files CRUD not used in models tests')
   }

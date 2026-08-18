@@ -227,6 +227,21 @@ export class DockerFileArchive implements FileArchive {
     throw new FileInvalidPath(relPath) // symlink / 特殊类型：不支持读
   }
 
+  // 原始字节读取（WebChat 媒体通道）：与 read() 的 file 分支同探针/收集路径，但**不做 NUL 嗅探与
+  // UTF-8 转码**——直接返回 entry.data Buffer（workspace 图片字节透传给浏览器）。超大文件 probe
+  // 已短路（oversized → FileInvalidPath）；非文件条目（目录/symlink）→ FileInvalidPath。
+  async readBytes(name: string, root: FileRoot, relPath: string): Promise<Buffer> {
+    const absPath = this.absPath(root, relPath)
+    const probed = await this.probe(name, absPath)
+    if (probed === null) throw new FileNotFound(relPath)
+    if (probed.kind === 'oversized') throw new FileInvalidPath(relPath)
+    if (probed.root.type !== 'file') throw new FileInvalidPath(relPath)
+    const full = parseTar(probed.buf, { collectData: true, maxDataBytes: MAX_FILE_READ_BYTES })
+    const entry = full[0]
+    if (!entry) throw new FileNotFound(relPath)
+    return entry.data ?? Buffer.alloc(0)
+  }
+
   async write(name: string, root: FileRoot, relPath: string, content: string): Promise<void> {
     const absPath = this.absPath(root, relPath)
     const probed = await this.probe(name, absPath)

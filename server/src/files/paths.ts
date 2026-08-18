@@ -6,6 +6,7 @@
 import { fail } from '../envelope'
 import { CODE } from '../codes'
 import type { FileRoot } from './fsPort'
+import { FILE_ROOTS } from './values'
 
 export type RelPathResult = { ok: true; path: string } | { ok: false; errors: string[] }
 
@@ -66,6 +67,17 @@ export function parseFileWriteBody(body: unknown): { root: FileRoot; path: strin
   if (contentError) errors.content = contentError
   if (!rootRes.ok || !pathRes.ok || pathRes.path === '' || contentError) throw fail(CODE.VALIDATION_FAILED, undefined, errors)
   return { root: rootRes.root, path: pathRes.path, content: b.content as string }
+}
+
+// WebChat 媒体端点（files/raw）的绝对路径解析：agent mediaUrls 携带容器内绝对路径
+//（如 /home/node/.openclaw/workspace/test.png）——校验必须落在 workspace 树根前缀内（单一来源
+// FILE_ROOTS.workspace），剥离前缀得相对路径后复用 normalizeFilePath 防穿越/反斜杠/NUL/超长。
+// 非 workspace 前缀一律拒绝（不暴露 wiki 或其它容器内路径）；缺省/非字符串 → 拒绝。
+export function resolveWorkspaceAbsPath(raw: unknown): RelPathResult {
+  if (typeof raw !== 'string' || !raw) return { ok: false, errors: ['path 须为容器内 workspace 绝对路径'] }
+  const prefix = `${FILE_ROOTS.workspace}/`
+  if (!raw.startsWith(prefix)) return { ok: false, errors: ['仅允许读取 workspace 目录内文件'] }
+  return normalizeFilePath(raw.slice(prefix.length))
 }
 
 // query 形态（GET/DELETE）：root / path 各自校验，非法 → 抛 90002 + data 字段明细。
