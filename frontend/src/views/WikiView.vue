@@ -3,6 +3,7 @@
 // 版面：顶部容器切换器 + 左文件树 + 中 Milkdown 编辑器 + 右图谱（可折叠）。
 // 联动：点树/图谱节点 openPage；编辑器 update → store.edit（防抖自动保存落盘）；
 // 顶部切换容器 → store.switchContainer（切前自动落盘）。新建/删除经 store，落盘并触发 compile。
+// #668：左文件树由面板三态包装接管（inline 拖宽 / collapsed 窄条 / popped 浮层）。
 import { onMounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -11,12 +12,44 @@ import { getGraph } from '@/api/wiki'
 import type { WikiGraphDTO } from '@/api/wiki'
 import { ApiError } from '@/api/errors'
 import { useWikiStore } from '@/stores/wiki'
+import { useAuthStore } from '@/stores/auth'
+import { INLINE_RANGE_NARROW } from '@/panels/triState'
+import { usePanelTriState } from '@/panels/usePanelTriState'
 import FileTree from '@/components/FileTree.vue'
 import MdEditor from '@/components/MdEditor.vue'
 import WikiGraph from '@/components/WikiGraph.vue'
+import PanelTriState from '@/components/PanelTriState.vue'
 
 const store = useWikiStore()
 const { current, groups, activePath, draft, dirty, saving, saveSeq } = storeToRefs(store)
+
+// #668：文件树三态（inline 拖宽 160–560px / collapsed 窄条 / popped 浮层）。
+// 宽度按用户+页面+面板落 localStorage，collapsed/popped 态不持久化。
+const auth = useAuthStore()
+// 沿用页面原 220px 固定宽（无存储值时的默认宽度，窄屏 disabled 态同样用它）
+const FILE_TREE_DEFAULT_WIDTH = 220
+const filePanel = usePanelTriState({
+  view: 'wiki',
+  panel: 'file-tree',
+  side: 'left',
+  inlineRange: INLINE_RANGE_NARROW,
+  defaultInlineWidth: FILE_TREE_DEFAULT_WIDTH,
+  token: () => auth.token,
+})
+const {
+  state: panelState,
+  inlineWidth,
+  poppedVw,
+  disabled: panelDisabled,
+  viewportWidth,
+  onCollapse,
+  onPop,
+  onExpand,
+  onRestore,
+  onResizeInline,
+  onResizePopped,
+  onDragEnd,
+} = filePanel
 
 // #493: 错误二分（对齐 LoginView codex P2 惯用法）——仅「已解析的 API 错误」（信封/HTTP 语义，
 // 如 20040 越权）逐字透传后端真实消息；其余（AbortError "Fetch is aborted" / TypeError "Load failed"
@@ -163,7 +196,23 @@ onMounted(async () => {
     </header>
 
     <div class="wiki-body">
-      <aside class="left">
+      <PanelTriState
+        :state="panelState"
+        side="left"
+        label="文件树"
+        :disabled="panelDisabled"
+        :inline-width="inlineWidth"
+        :default-width="FILE_TREE_DEFAULT_WIDTH"
+        :popped-vw="poppedVw"
+        :viewport-width="viewportWidth"
+        @collapse="onCollapse"
+        @pop="onPop"
+        @expand="onExpand"
+        @restore="onRestore"
+        @resize-inline="onResizeInline"
+        @resize-popped="onResizePopped"
+        @drag-end="onDragEnd"
+      >
         <FileTree
           :groups="groups"
           :active-path="activePath"
@@ -171,7 +220,7 @@ onMounted(async () => {
           @create="onCreate"
           @delete="onDelete"
         />
-      </aside>
+      </PanelTriState>
 
       <main class="center">
         <MdEditor v-if="activePath" :content="draft" @update="onEdit" />
@@ -230,13 +279,11 @@ onMounted(async () => {
   flex: 1;
   min-height: 0;
 }
-.left {
-  width: 220px;
-  border-right: 1px solid var(--el-border-color);
-  overflow-y: auto;
-}
 .center {
   flex: 1;
+  /* #668：min-width:0 放开 flex 默认 min-content 下限——面板拖到 560px 时编辑区收缩
+     到剩余空间而不是把 .wiki-body 顶溢出（「中间编辑区不被挤没」的实现保障）。 */
+  min-width: 0;
   overflow-y: auto;
   padding: 16px 24px;
 }

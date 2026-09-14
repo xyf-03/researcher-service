@@ -21,12 +21,23 @@ import { FileNotFound } from '../src/files/errors'
 import { InlineLifecycleQueue } from '../src/containers/lifecycleQueue'
 import { defaultReservedPorts, type FleetConfig } from '../src/containers/values'
 import { namedVolumesFor, volumeOrder } from '../src/containers/runtime'
+import { RunOnceError } from '../src/containers/errors'
+import { LABEL_ONESHOT_KEY, LABEL_ONESHOT_VALUE } from '../src/containers/constants'
 import { DEV_ENCRYPTION_KEYS } from '../src/crypto'
 import { ensureImageAvailable, type PullProgressClient } from './smokeDocker'
 
 // #592 三卷拓扑断言 helper：卷存在（inspect 成功）/ 不存在（daemon 404 → reject statusCode 404）
 function inspectVolume(name: string): Promise<Docker.VolumeInspectInfo> {
   return new Docker().getVolume(name).inspect()
+}
+
+// #696 独立事实源：直查 daemon 上带 oneshot 标记的容器（不看 runtime 的过滤视图——证「临时容器
+// 真起过」以及「全路径回收后无残留」）。
+function markedOneShotContainers(): Promise<Docker.ContainerInfo[]> {
+  return new Docker().listContainers({
+    all: true,
+    filters: { label: [`${LABEL_ONESHOT_KEY}=${LABEL_ONESHOT_VALUE}`] },
+  })
 }
 
 describe('ensureImageAvailable / drainPull（pull progress 消费，codex PR#346 P2）', () => {
@@ -186,5 +197,55 @@ describe('containers 集成 smoke（真 docker daemon）', () => {
     } finally {
       await orch.delete('smoke-files')
     }
+  }, 120_000)
+
+  // #696 oneshot 原语端到端（真 daemon + 真 fleet 镜像）：收退出码、全路径回收、fleet 列表不可见。
+  it('runOnce：真临时容器收退出码并回收；跑动期间对 fleet 列表不可见（#696）', async () => {
+    expect(await markedOneShotContainers()).toHaveLength(0) // 前置：无残留临时容器
+
+    // ① 跑动期间不可见：后台起一个短睡临时容器（不 await），轮询 daemon 上的标记容器作为「真起过」
+    //    的事实源；一旦观察到，fleet 列表（app=openclaw-fleet 过滤）此刻不得含它，且它无端口发布。
+    const running = runtime.runOnce({ image: IMAGE, cmd: ['sh', '-c', 'sleep 4'] })
+    // 起手即挂 rejection 处理：runOnce 若在下方最长 30s 的轮询窗口里早失败（如镜像拉取失败），
+    // 不能让 unhandled rejection 冒出来掩盖真实原因——它的结局在本用例末尾统一断言。
+    const runOutcome = running.then(
+      (r) => ({ ok: true as const, output: r.output }),
+      (e: unknown) => ({ ok: false as const, error: e }),
+    )
+    let observed: Docker.ContainerInfo | null = null
+    const deadline = Date.now() + 30_000
+    while (observed === null && Date.now() < deadline) {
+      const live = await markedOneShotContainers()
+      if (live.length > 0) {
+        observed = live[0]
+        const fleet = await runtime.listFleet()
+        expect(fleet.some((c) => c.containerId === observed?.Id)).toBe(false) // 不进 fleet 列表
+        // 不参与端口对账：无宿主端口发布。断 PublicPort（而非 Ports 为空）——镜像自带 EXPOSE 时
+        // listContainers 仍报 PrivatePort 条目，那不影响对账（对账只认宿主发布端口）。
+        expect((observed.Ports ?? []).every((p) => p.PublicPort === undefined)).toBe(true)
+      } else {
+        await new Promise((r) => setTimeout(r, 100))
+      }
+    }
+    const outcome = await runOutcome // runOnce 已在轮询期间跑完：失败就把真实原因抛出来
+    if (!outcome.ok) throw outcome.error
+    expect(observed).not.toBeNull() // 临时容器真在 daemon 上起过（非「没跑起来所以看不到」）
+    expect(outcome.output).toBe('') // `sleep 4` 无输出
+
+    // ② 退出码 0：收 stdout+stderr 合并输出
+    const ok = await runtime.runOnce({ image: IMAGE, cmd: ['sh', '-c', 'echo oneshot-ok; echo oneshot-err >&2'] })
+    expect(ok.output).toContain('oneshot-ok')
+    expect(ok.output).toContain('oneshot-err')
+
+    // ③ 非 0 退出：抛 RunOnceError，携带退出码与输出
+    const err = await runtime
+      .runOnce({ image: IMAGE, cmd: ['sh', '-c', 'echo oneshot-boom >&2; exit 7'] })
+      .catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(RunOnceError)
+    expect((err as RunOnceError).exitCode).toBe(7)
+    expect((err as RunOnceError).output).toContain('oneshot-boom')
+
+    // ④ 全路径回收：daemon 上无残留标记容器
+    expect(await markedOneShotContainers()).toHaveLength(0)
   }, 120_000)
 })

@@ -16,9 +16,19 @@ export const LABEL_APP_KEY = 'app'
 export const LABEL_APP_VALUE = 'openclaw-fleet'
 export const LABEL_INSTANCE_KEY = 'openclaw.instance'
 export const LABEL_PORT_KEY = 'openclaw.port'
-// 容器内固定 bind-mount 路径（#591：仅 home 目录 rw bind 承载 workspace/wiki/state/logs；
-// openclaw.json 落 home 内默认路径 ~/.openclaw/openclaw.json——静态 config，无独立 config bind）
+// #696 一次性临时容器标记（runOnce）：与 fleet 三标签互斥——临时容器不写 app/instance/port 标签、
+// 不发布宿主端口，故 listFleet（按 app 过滤）与端口对账均不可见；本标签仅用于「认出临时容器」
+//（daemon 侧泄漏排查 / 冒烟断言）。
+export const LABEL_ONESHOT_KEY = 'openclaw.oneshot'
+export const LABEL_ONESHOT_VALUE = 'true'
+// 容器内 home 路径（openclaw.json 落其内默认路径 ~/.openclaw/openclaw.json——静态 config，无独立
+// config bind）。#591 时指「home 目录 rw host bind」（承载 workspace/wiki/state/logs）；#590/ADR 0011
+// 起默认走 named volume 拓扑（三卷，见 MOUNT_*），host bind 仅遗留路径/调试用。
 export const HOME_BIND = '/home/node/.openclaw'
+// 三卷在容器内的挂载点（#590 拓扑）：挂载布局是共享内核纯知识——真容器 buildRunOptions 与
+// files 域树根（FILE_ROOTS）都从这里取，防路径字面量多处手写漂移；home 卷直接挂 HOME_BIND。
+export const MOUNT_WIKI = `${HOME_BIND}/wiki/main`
+export const MOUNT_WORKSPACE = `${HOME_BIND}/workspace`
 // gateway 网络绑定模式（容器内 gateway 绑 lan，宿主侧靠 Docker 端口映射隔离）
 export const GATEWAY_BIND = 'lan'
 // env 占位：真 token 绝不落盘 JSON，保留 ${GATEWAY_TOKEN} 由 gateway 进程运行时插值

@@ -4,7 +4,7 @@
 // （gateway/定时器/请求代）归 useChatConnection 同宿主（#340 关键约束）。
 import { defineStore } from 'pinia'
 import type { InstanceDTO } from '@/api/containers'
-import type { CommandDTO, SessionDTO } from '@/chat/gatewayChat'
+import type { CommandDTO, SessionBranchDTO, SessionDTO } from '@/chat/gatewayChat'
 import type { MediaBlock } from '@/chat/eventTranslate'
 import { isSubagentApproval, isSubagentSessionKey } from '@/chat/subagentApproval'
 
@@ -29,6 +29,29 @@ export interface Msg {
   // replace 快照）双路径提取；与 text 独立数据通道（文本提取语义不污染，附件渲染走这里）。
   // 纯图片消息（text 空但 media 非空）照常渲染。user 发送的附件也入此（echo 渲染）。
   media: MediaBlock[]
+  // T1 轮次折叠（#664 / CONTEXT.md「折叠条」）：轮次正常完成后轨迹（思考+工具）收进折叠条的
+  // 折叠态。可选（缺省展开）：done 帧自动置 true；T3（#666）起历史翻译（loadHistory/分页/外来
+  // 可见 final 局部插入）有轨迹的 assistant 消息默认置 true；手动开合经 toggleTraceFold mutation；
+  // error/断线/宽限收尾不置值。正文与附件恒在折叠外，不受此字段影响。
+  traceFolded?: boolean
+  // T2 执行时长（#665 / CONTEXT.md「执行时长」）：本轮 send → done 的墙钟毫秒数（含建连排队/
+  // 审批等待/断线重连间隔——墙钟语义）。可选：done 帧落定（时长信号同折叠信号独占 done）；
+  // 历史轮/error/断线/宽限收尾缺省 undefined（条面回退「执行过程 · …」计数文案）。
+  turnDurationMs?: number
+  // #694 网关 transcript 条目 id（网关 chat.history 每条消息 __openclaw.id → translateHistoryMessage
+  // 单点提取，官方 Control UI 亦取此值作 data-entry-id）。语义 = 该消息在网关 transcript DAG 里的
+  // 持久化条目身份，回退/fork/分支切换（sessions.rewind 等）的定位参数。**仅已持久化消息有值**：
+  // 本地乐观 echo（send/resendOutbox 新建的 Msg）与流式占位缺省 undefined——UI 据此不显示任何
+  // 消息级操作入口（不可对未落库的消息发起 rewind）。与分页锚点（historyAnchor/nextOffset，number
+  // offset | string messageId 两态）是**不同字段**，禁止混用（Codex #678 P1 教训）。
+  entryId?: string
+  // #694（Codex #703 P1）：本轮发送键 = chat.send 的 idempotencyKey，仅本地乐观 echo 有值（同轮
+  // assistant 占位不需要；历史翻译的消息 entryId 直接来自网关，无需回读）。网关取该键作 clientRunId
+  // （openclaw dist `chat-send-handler` 实证），故落库的用户条目 __openclaw.idempotencyKey 为
+  // `${sendKey}:user`——ack 到达后据此回读最新一页历史，把网关条目 id 补进 entryId
+  // （见 markUserEntryId）。否则「刚发出的那条」在切会话/重连前没有 entryId，回退入口不渲染，
+  // 而它恰是回退的主用例。
+  sendKey?: string
 }
 
 // T06 审批卡（连接级，无 runId）：独立列表渲染，不混入 messages——避免破坏流式锚定/finalizeLast
@@ -60,10 +83,27 @@ export function newMsg(role: 'user' | 'assistant', text = ''): Msg {
   }
 }
 
+// 轨迹判定（#664 / CONTEXT.md「轨迹」）：思考非空或工具行非空即有轨迹；正文与附件不算轨迹。
+// 无轨迹的轮次不渲染折叠条。store（foldLastTrace）与渲染层（折叠条渲染门）共用此单一实现。
+export function hasTrace(m: Msg): boolean {
+  return m.thinking !== '' || m.tools.length > 0
+}
+
+// 默认折叠判定（审查 Standards 轴：foldLastTrace 与历史翻译两处的「assistant 且有轨迹」条件
+// 收敛单一实现）——#664 done 帧自动折叠与 #666 历史翻译默认折叠共用；user 消息与无轨迹
+// 消息不折叠（渲染层本就不渲染折叠条）。
+export function shouldFoldTrace(m: Msg): boolean {
+  return m.role === 'assistant' && hasTrace(m)
+}
+
 export const useChatStore = defineStore('chat', {
   state: () => ({
     instances: [] as InstanceDTO[],
     sessions: [] as SessionDTO[],
+    // #698 分支菜单：会话级渲染投影（贴 sessions 先例，#693 spec §1.2「branches 数组入 chat
+    // store」）。active:true 项的 leafEntryId 是分支 CAS 的唯一权威基准（#700 消费）。拉取失败
+    // /单分支/能力缺失统一表现为空或单元素 → 头部按钮不渲染（length > 1 门）。
+    branches: [] as SessionBranchDTO[],
     selectedContainer: '' as string,
     selectedSession: '' as string,
     messages: [] as Msg[],
@@ -107,13 +147,20 @@ export const useChatStore = defineStore('chat', {
     setSessions(list: SessionDTO[]): void {
       this.sessions = list
     },
+    // #698：整替（非追加）——重拉后旧列表不残留；stale 丢弃由调用层守卫负责（branchesGen）。
+    setBranches(list: SessionBranchDTO[]): void {
+      this.branches = list
+    },
     setSelectedContainer(name: string): void {
       this.selectedContainer = name
     },
     setSelectedSession(key: string): void {
       this.selectedSession = key
     },
+    // #697 幂等：同 key 重复插入（fork prepend 后 refreshSessions 合并前的重复路径）不重复行，
+    // 且保留首次行字段（占位行不覆盖已在位的权威行）。
     prependSession(s: SessionDTO): void {
+      if (this.sessions.some((x) => x.session_key === s.session_key)) return
       this.sessions = [s, ...this.sessions]
     },
     removeSession(key: string): void {
@@ -131,8 +178,22 @@ export const useChatStore = defineStore('chat', {
     insertBeforeLast(m: Msg): void {
       this.messages.splice(this.messages.length - 1, 0, m)
     },
+    // PHASE 2 retry-run handoff：空 final 失败 fallback 移除最后一条消息。**仅限**删除「本次
+    // pendingSend 创建且仍完全空（text/media/tools 全空）」的 assistant 占位——调用方
+    // （useChatConnection.armRetryWindow）在删除前按该条件校验，绝不删除任何已有可见消息。
+    // 刻意不做成任意 index 删除，保持最小 API。
+    popMessage(): void {
+      this.messages.pop()
+    },
     setMessages(list: Msg[]): void {
       this.messages = list
+    },
+    // #694（Codex #703 P1）：把网关回读的 transcript 条目 id 补回本地乐观 user 消息——按发送键
+    // （Msg.sendKey）精确定位。命中才写：消息已出列（切会话/容器重建后旧对象不在投影内）或已有
+    // entryId（历史翻译给过）时不动，避免无意义的响应式触发。
+    markUserEntryId(sendKey: string, entryId: string): void {
+      const m = this.messages.find((x) => x.role === 'user' && x.sendKey === sendKey && !x.entryId)
+      if (m) m.entryId = entryId
     },
     // 最后一条助手消息：仅当仍是占位/流式时落定（done/error/断线收尾共用）
     finalizeLast(): void {
@@ -141,6 +202,26 @@ export const useChatStore = defineStore('chat', {
         last.streaming = false
         last.thinkingOpen = false
       }
+    },
+    // T1 轮次折叠（#664）：done 正常完成后收起该轮轨迹（最后一条 assistant 消息有轨迹时）。
+    // 折叠信号独占 done 帧——仅 useChatConnection.handleDone 的本 run 终态分支调用，不得挂共享
+    // 收尾 finalizeLast（error/断线/8s 宽限收尾不折叠）。每次 run 终态只发生一次，手动展开后
+    // 无第二次自动收起。
+    foldLastTrace(): void {
+      const last = this.messages[this.messages.length - 1]
+      if (last && shouldFoldTrace(last)) last.traceFolded = true
+    },
+    // T1 手动开合（#664）：折叠条 emit 回父层落 store（贴既有纯 mutation 形态）。自动折叠只在
+    // done 发生一次，手动开合不被自动覆盖。
+    toggleTraceFold(m: Msg): void {
+      m.traceFolded = !m.traceFolded
+    },
+    // T2 执行时长（#665）：done 正常完成落定本轮墙钟毫秒。仅 useChatConnection.handleDone 的
+    // 本 run 终态分支调用（与 foldLastTrace 同点，起点在连接簇闭包 turnStartedAt）；error/
+    // 断线/宽限收尾不落定（异常轮无「已执行」可言，条面回退计数文案）。
+    setLastTurnDuration(ms: number): void {
+      const last = this.messages[this.messages.length - 1]
+      if (last && last.role === 'assistant') last.turnDurationMs = ms
     },
     setInput(v: string): void {
       this.input = v
@@ -234,12 +315,14 @@ export const useChatStore = defineStore('chat', {
       this.historyHasMore = false
       this.historyAnchor = null
       this.historyLoading = false
+      this.branches = [] // #698：切容器必换会话，分支随之作废
     },
     resetForSession(): void {
       this.messages = []
       this.historyHasMore = false
       this.historyAnchor = null
       this.historyLoading = false
+      this.branches = [] // #698：分支属于单个会话，切会话不得残留（length 门会误渲染按钮）
     },
   },
 })

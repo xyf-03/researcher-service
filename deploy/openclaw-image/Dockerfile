@@ -7,9 +7,20 @@
 # 经 OPENCLAW_IMAGE 注入（server config.ts 默认值指向本镜像 ghcr.io/acautomata/researcher-service/openclaw）。
 # 构建期断言：pdftotext 可用 + 骨架齐全，任一缺失即构建失败（不带病出镜像）。
 #
-# 构建：docker build -t ghcr.io/acautomata/researcher-service/openclaw:latest deploy/openclaw-image
+# 版本 tag 约定（issue #695）：下面 FROM 行的基线 tag 是**唯一版本源**——CD 从本行提取版本并推送
+# 派生镜像版本 tag（`:<基线 tag>`，与 :latest / :<sha> 并存，见 .github/workflows/cd.yml）；控制面
+# 默认目标镜像（server/src/config.ts OPENCLAW_IMAGE 默认值）与之同版本，两处由
+# server/test/openclawImage.test.ts 交叉断言锁死（防双源漂移）。**版本 tag 一经发布不可移动**——升级
+# 编排的检测判定是「容器记录镜像 ≠ 当前目标」，移动 tag 会让历史容器与目标的关系不可复现。换内容
+# （改叠加层/骨架）须 bump 版本、**不得原地覆盖同名 tag**，分两种情形：① 基线前进（上游新版）：改本行
+# + 同步四处运行期明文（config 默认值 / 模板栈 compose / dev driver / 测试常量）；② **基线不变、只换
+# 叠加层**：当前单源约定无 tag 可表达，须另立决策（把版本单源改成独立常量），不能改本行充数。
+# 详见 deploy/README.md「派生镜像版本 tag 约定」。
+#
+# 构建：docker build -t ghcr.io/acautomata/researcher-service/openclaw:<基线 tag> deploy/openclaw-image
+#（本地开发手工打 tag 步骤见 deploy/README.md「派生镜像版本 tag 约定」）
 
-FROM ghcr.io/openclaw/openclaw:2026.7.1-browser
+FROM ghcr.io/openclaw/openclaw:2026.9.4-browser
 
 USER root
 

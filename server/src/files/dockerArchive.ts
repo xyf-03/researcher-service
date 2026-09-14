@@ -9,13 +9,15 @@
 // 不把文件内容拉进控制面内存（列表/删除/覆写的大文件同理只读头）。
 
 import Docker from 'dockerode'
+import { readdir, readFile, stat } from 'node:fs/promises'
+import path from 'node:path'
 import { Readable } from 'node:stream'
 import { containerName } from '../containers/runtime'
 import { HOME_BIND } from '../containers/constants'
 import { FileExists, FileInvalidPath, FileNotFound } from './errors'
 import type { DirListing, FileArchive, FileEntry, FileReading, FileRoot } from './fsPort'
 import { FILE_ROOTS, MAX_FILE_READ_BYTES, WALK_LIMIT } from './values'
-import { alignTo, createTarFile, parseNumeric, parseTar, type TarEntry } from './tar'
+import { alignTo, createTarFile, createTarTree, parseNumeric, parseTar, type TarEntry, type TarTreeEntry } from './tar'
 
 // #591 静态 config：容器内 openclaw.json 固定路径（gateway 默认读取位，无 OPENCLAW_CONFIG_PATH）
 const CONFIG_PATH = `${HOME_BIND}/openclaw.json`
@@ -37,6 +39,25 @@ function toEntry(t: TarEntry): FileEntry {
     size: t.size,
     modified: new Date(t.mtime * 1000).toISOString(),
   }
+}
+
+// 模板目录树 walk（seedWorkspace 源收集）：先序（目录条目先于其内容），同层按名字典序稳定
+// 产出；符号链接跳过（不 dereference、不产链接条目——模板树自包含，悬空链接不炸 create）。
+async function walkTree(absDir: string, relDir: string): Promise<TarTreeEntry[]> {
+  const names = await readdir(absDir, { withFileTypes: true })
+  names.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+  const out: TarTreeEntry[] = []
+  for (const d of names) {
+    const abs = path.join(absDir, d.name)
+    const rel = relDir === '' ? d.name : `${relDir}/${d.name}`
+    if (d.isDirectory()) {
+      out.push({ name: rel, type: 'directory' })
+      out.push(...(await walkTree(abs, rel)))
+    } else if (d.isFile()) {
+      out.push({ name: rel, type: 'file', content: await readFile(abs) })
+    }
+  }
+  return out
 }
 
 function mtimeIso(mtime: number): string {
@@ -276,6 +297,24 @@ export class DockerFileArchive implements FileArchive {
     const container = this.client().getContainer(containerName(name))
     await container.putArchive(Readable.from([createTarFile('openclaw.json', Buffer.from(content, 'utf8'))]), {
       path: HOME_BIND,
+    })
+  }
+
+  // 模板 workspace 灌卷（#6xx · named volume 拓扑下 researcher workspace 预填充）：递归 walk
+  // hostDir → 目录树 tar（目录先序条目，父目录先建）→ putArchive 解包进 ~/.openclaw/workspace。
+  // chown:true（daemon 语义：应用 tar 头内 uid/gid）+ 头写 node(1000)，灌入文件 node:node——
+  // agent 在容器内可写自己的工作区（#660 曾误注「跟随目标目录」，bt 宿主实测不符）。
+  // 时序同 writeConfig（create 后 start 前，putArchive 对 created 容器可用）；骨架首挂内容被
+  // 同名覆盖（researcher 模板为权威源）。hostDir 不存在/非目录 → 原样抛（fail-fast 不带病出容器）。
+  async seedWorkspace(name: string, hostDir: string): Promise<void> {
+    const root = path.resolve(hostDir)
+    const rootStat = await stat(root)
+    if (!rootStat.isDirectory()) throw new FileInvalidPath(root)
+    const entries = await walkTree(root, '')
+    const container = this.client().getContainer(containerName(name))
+    await container.putArchive(Readable.from([createTarTree(entries)]), {
+      path: FILE_ROOTS.workspace, // 树根 = 挂载点单一来源（values.ts ← containers/constants 的 MOUNT_*）
+      chown: true,
     })
   }
 

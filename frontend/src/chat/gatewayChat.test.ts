@@ -855,6 +855,16 @@ describe('createGatewayChat（#369 隧道 Facade）', () => {
     expect(h).toEqual({ messages: [{ role: 'assistant', text: 'a' }], hasMore: true, nextOffset: 5 })
   })
 
+  it('getHistory：number cursor → offset 参数（协议区分数值偏移与字符串锚点，不可 stringify 成 messageId）', async () => {
+    const { gw, client } = makeGateway()
+    client.request.mockResolvedValue({ messages: [], hasMore: true, nextOffset: 45 })
+    const h = await gw.getHistory('sk-1', 50, 95)
+    // 网关 chat.history 把数值 offset 与字符串 messageId 当两个独立参数（docs.openclaw.ai/gateway/protocol）：
+    // number cursor 须作为 offset 发送；若错传为 messageId，offset 分页会话第二页起拉错/拉不到。
+    expect(client.request).toHaveBeenCalledWith('chat.history', { sessionKey: 'sk-1', limit: 50, offset: 95 })
+    expect(h).toEqual({ messages: [], hasMore: true, nextOffset: 45 })
+  })
+
   it('getHistory 缺省分页字段 → 回退', async () => {
     const { gw, client } = makeGateway()
     client.request.mockResolvedValue({ messages: [] })
@@ -1310,5 +1320,230 @@ describe('#377 设备配对生命周期（GatewayBrowserDeviceAuthLifecycle 接�
       client.close({ code: 1000, reason: 'x', connectFailure: { error: tokenMismatchError('AUTH_DEVICE_TOKEN_MISMATCH') } })
       await vi.waitFor(() => expect(client.start).toHaveBeenCalledTimes(2 + i))
     }
+  })
+})
+
+// #694 会话控制能力探测 + sessions.rewind RPC——对话回退端到端（#693 spec §1.1/§1.4）的协议层。
+// capability 单一来源 = hello-ok 的 features.methods 快照：4 个会话控制方法全部在位才判「可用」
+// （9.4+ 网关；过渡期存量 7.1 镜像无该字段或缺项 → 不可用 → UI 隐藏全部回退/fork/分支入口）。
+// 0 信任：字段形状非数组 / 含非字符串项一律按不可用处理，不抛错。
+describe('#694 会话控制能力探测', () => {
+  const SESSION_CONTROL_METHODS = [
+    'sessions.rewind',
+    'sessions.fork',
+    'sessions.branches.list',
+    'sessions.branches.switch',
+  ]
+
+  it('hello-ok.features.methods 含全部 4 个会话控制方法 → 可用', () => {
+    const { gw, client } = makeGateway()
+    expect(gw.sessionControlAvailable()).toBe(false) // 未握手：不可用（入口隐藏，不必等 hello）
+    client.fireConnectHello({ features: { methods: [...SESSION_CONTROL_METHODS, 'chat.send'] } }, {})
+    expect(gw.sessionControlAvailable()).toBe(true)
+  })
+
+  it('旧网关（无 features 字段 / methods 缺项）→ 不可用（过渡期存量 7.1 镜像）', () => {
+    const { gw, client } = makeGateway()
+    client.fireConnectHello({ auth: {} }, {}) // 7.1 网关形状：无 features
+    expect(gw.sessionControlAvailable()).toBe(false)
+
+    client.fireConnectHello({ features: { methods: ['sessions.rewind', 'chat.send'] } }, {})
+    expect(gw.sessionControlAvailable()).toBe(false) // 缺 fork/branches → 整体不可用
+  })
+
+  it('0 信任：methods 非数组 / 含非字符串项 → 不崩，按 0 信任判定', () => {
+    const { gw, client } = makeGateway()
+    client.fireConnectHello({ features: { methods: 'sessions.rewind' } }, {})
+    expect(gw.sessionControlAvailable()).toBe(false)
+
+    client.fireConnectHello({ features: { methods: [...SESSION_CONTROL_METHODS, 123, null] } }, {})
+    expect(gw.sessionControlAvailable()).toBe(true) // 非字符串项跳过，4 个名字齐 → 可用
+  })
+
+  it('重连后能力跟着新 hello 走（同实例二次握手：网关升级/降级都如实反映）', () => {
+    const { gw, client } = makeGateway()
+    client.fireConnectHello({ features: { methods: [...SESSION_CONTROL_METHODS] } }, {})
+    expect(gw.sessionControlAvailable()).toBe(true)
+    // 重连到旧网关（如容器被换回 7.1 镜像）：能力撤销，入口重新隐藏
+    client.fireConnectHello({ features: { methods: ['chat.send'] } }, {})
+    expect(gw.sessionControlAvailable()).toBe(false)
+  })
+})
+
+describe('#694 sessions.rewind RPC', () => {
+  it('rewind → sessions.rewind{sessionKey,entryId} + 结果 0 信任校准（editorText/editorAttachments）', async () => {
+    const { gw, client } = makeGateway()
+    client.request.mockResolvedValue({
+      editorText: '被剪的那句话',
+      editorAttachments: [
+        { mimeType: 'image/png', data: 'AAAA' },
+        { mimeType: 'image/jpeg' }, // 缺 data → 跳过
+        { data: 'BBBB' }, // 缺 mimeType → 跳过
+        'not-a-dict',
+        { mimeType: '', data: 'CCCC' }, // 空 mimeType → 跳过
+      ],
+    })
+    const res = await gw.rewind('sk-1', 'entry-9')
+    expect(client.request).toHaveBeenCalledWith('sessions.rewind', { sessionKey: 'sk-1', entryId: 'entry-9' })
+    expect(res).toEqual({
+      editorText: '被剪的那句话',
+      editorAttachments: [{ mimeType: 'image/png', data: 'AAAA' }],
+    })
+  })
+
+  it('rewind 响应缺字段/异形（旧网关、异常形状）→ 空结果，不崩', async () => {
+    const { gw, client } = makeGateway()
+    client.request.mockResolvedValueOnce({ editorText: 42, editorAttachments: 'x' })
+    await expect(gw.rewind('sk-1', 'e1')).resolves.toEqual({ editorText: '', editorAttachments: [] })
+    client.request.mockResolvedValueOnce(undefined)
+    await expect(gw.rewind('sk-1', 'e1')).resolves.toEqual({ editorText: '', editorAttachments: [] })
+  })
+
+  it('rewind 被网关拒绝（entryId 不在活跃路径等）→ 原样上抛（调用层据 details.reason 分类）', async () => {
+    const { gw, client } = makeGateway()
+    client.request.mockRejectedValue(
+      new MockGatewayProtocolRequestError({
+        gatewayCode: 'INVALID_REQUEST',
+        message: 'message entry is not on the active path: e1',
+      }),
+    )
+    await expect(gw.rewind('sk-1', 'e1')).rejects.toThrow('message entry is not on the active path: e1')
+  })
+})
+
+// #697 sessions.fork RPC——对话 fork 端到端（#693 spec 前端线）协议层。与 rewind 同形请求
+// （sessionKey+entryId 原样透传，切点 = 被点消息之前的活跃路径前缀），差异仅在结果多必有
+// sessionKey（新会话 key，后续 prependSession/pickSession 编排的前提——异形即整单判失败）。
+describe('#697 sessions.fork RPC', () => {
+  it('fork → sessions.fork{sessionKey,entryId} 原样透传 + 结果校准（sessionKey/editorText/editorAttachments）', async () => {
+    const { gw, client } = makeGateway()
+    client.request.mockResolvedValue({
+      sessionKey: 'sk-fork-1',
+      editorText: '被分叉的那句话',
+      editorAttachments: [
+        { mimeType: 'image/png', data: 'AAAA' },
+        { mimeType: 'image/jpeg' }, // 缺 data → 跳过
+      ],
+    })
+    const res = await gw.forkEntry('sk-1', 'entry-9')
+    expect(client.request).toHaveBeenCalledWith('sessions.fork', { sessionKey: 'sk-1', entryId: 'entry-9' })
+    expect(res).toEqual({
+      sessionKey: 'sk-fork-1',
+      editorText: '被分叉的那句话',
+      editorAttachments: [{ mimeType: 'image/png', data: 'AAAA' }],
+    })
+  })
+
+  it('fork 响应缺 sessionKey / 非字符串 → 整单判失败（后续导航无前提，不得回落到空结果）', async () => {
+    const { gw, client } = makeGateway()
+    client.request.mockResolvedValueOnce({ editorText: 'x' })
+    await expect(gw.forkEntry('sk-1', 'e1')).rejects.toThrow()
+    client.request.mockResolvedValueOnce({ sessionKey: 42 })
+    await expect(gw.forkEntry('sk-1', 'e1')).rejects.toThrow()
+    client.request.mockResolvedValueOnce(undefined)
+    await expect(gw.forkEntry('sk-1', 'e1')).rejects.toThrow()
+  })
+
+  it('fork 响应 editor 字段缺省/异形 → 校准为空（与 rewind 同口径，不失败）', async () => {
+    const { gw, client } = makeGateway()
+    client.request.mockResolvedValueOnce({ sessionKey: 'sk-fork-2', editorText: 42, editorAttachments: 'x' })
+    await expect(gw.forkEntry('sk-1', 'e1')).resolves.toEqual({
+      sessionKey: 'sk-fork-2',
+      editorText: '',
+      editorAttachments: [],
+    })
+  })
+
+  it('fork 被网关拒绝（agent 工作中 / off-active-path 等）→ 原样上抛', async () => {
+    const { gw, client } = makeGateway()
+    client.request.mockRejectedValue(
+      new MockGatewayProtocolRequestError({
+        gatewayCode: 'UNAVAILABLE',
+        message: 'Fork is unavailable while the agent is working.',
+      }),
+    )
+    await expect(gw.forkEntry('sk-1', 'e1')).rejects.toThrow('agent is working')
+  })
+})
+
+// #698 分支菜单协议层（#693 spec §1.1/§4）：sessions.branches.list 走「0 信任校准」惯例
+//（逐字段 typeof 门，非法项/字段降级——leafEntryId 是 switch 的定位参数，缺它才砍整项）；
+// sessions.branches.switch 简单透传（resolveApproval 惯例），参数名注意是 leafEntryId（非 entryId）。
+describe('#698 sessions.branches.list RPC', () => {
+  it('listBranches → sessions.branches.list{sessionKey} + 正常形状逐字段透传', async () => {
+    const { gw, client } = makeGateway()
+    client.request.mockResolvedValue({
+      branches: [
+        { leafEntryId: 'leaf-1', headline: '聊聊 A 方案', messageCount: 12, updatedAt: '2026-09-12T01:02:03Z', active: true },
+        { leafEntryId: 'leaf-2', headline: '聊聊 B 方案', messageCount: 3, updatedAt: '2026-09-11T00:00:00Z', active: false },
+      ],
+    })
+    const res = await gw.listBranches('sk-1')
+    expect(client.request).toHaveBeenCalledWith('sessions.branches.list', { sessionKey: 'sk-1' })
+    expect(res).toEqual([
+      { leafEntryId: 'leaf-1', headline: '聊聊 A 方案', messageCount: 12, updatedAt: '2026-09-12T01:02:03Z', active: true },
+      { leafEntryId: 'leaf-2', headline: '聊聊 B 方案', messageCount: 3, updatedAt: '2026-09-11T00:00:00Z', active: false },
+    ])
+  })
+
+  it('0 信任门表：leafEntryId 缺/空/非 string → 跳整项（看得见切不了的死菜单项不入列）', async () => {
+    const { gw, client } = makeGateway()
+    client.request.mockResolvedValue({
+      branches: [
+        'not-a-dict', // 非对象元素跳过
+        null,
+        { headline: '没有 leaf' }, // 缺 leafEntryId
+        { leafEntryId: '', headline: '空 leaf' }, // 空 leafEntryId
+        { leafEntryId: 42 }, // 非 string
+        { leafEntryId: 'leaf-ok', headline: 'ok', messageCount: 1, active: false }, // 合法项保留
+      ],
+    })
+    const res = await gw.listBranches('sk-1')
+    expect(res.map((b) => b.leafEntryId)).toEqual(['leaf-ok'])
+  })
+
+  it('0 信任门表：纯展示字段异形 → 降级不砍项（headline→空串 / messageCount、updatedAt→undefined / active→false）', async () => {
+    const { gw, client } = makeGateway()
+    client.request.mockResolvedValue({
+      branches: [
+        {
+          leafEntryId: 'leaf-1',
+          headline: 42, // 非 string → ''（UI 层回退「未命名分支」）
+          messageCount: 'many', // 非 number → 不渲染「N 条消息」槽位
+          updatedAt: 12345, // 非 string → 不渲染时间槽位
+          active: 'yes', // 非 boolean → false（不砍项：标记损坏的分支仍可被切换）
+        },
+      ],
+    })
+    const res = await gw.listBranches('sk-1')
+    expect(res).toEqual([{ leafEntryId: 'leaf-1', headline: '', messageCount: undefined, updatedAt: undefined, active: false }])
+  })
+
+  it('0 信任：branches 非数组 / 缺字段（旧网关、异常形状）→ 空列表，不崩不抛错', async () => {
+    const { gw, client } = makeGateway()
+    client.request.mockResolvedValueOnce({ branches: 'x' })
+    await expect(gw.listBranches('sk-1')).resolves.toEqual([])
+    client.request.mockResolvedValueOnce(undefined)
+    await expect(gw.listBranches('sk-1')).resolves.toEqual([])
+  })
+})
+
+describe('#698 sessions.branches.switch RPC', () => {
+  it('switchBranch → sessions.branches.switch{sessionKey,leafEntryId}（参数名是 leafEntryId，非 entryId）', async () => {
+    const { gw, client } = makeGateway()
+    client.request.mockResolvedValue({})
+    await gw.switchBranch('sk-1', 'leaf-2')
+    expect(client.request).toHaveBeenCalledWith('sessions.branches.switch', { sessionKey: 'sk-1', leafEntryId: 'leaf-2' })
+  })
+
+  it('switch 被网关拒绝（no-op 选已活跃分支等）→ 原样上抛（调用层如实提示，不静默）', async () => {
+    const { gw, client } = makeGateway()
+    client.request.mockRejectedValue(
+      new MockGatewayProtocolRequestError({
+        gatewayCode: 'INVALID_REQUEST',
+        message: 'branch is already active',
+      }),
+    )
+    await expect(gw.switchBranch('sk-1', 'leaf-1')).rejects.toThrow('branch is already active')
   })
 })

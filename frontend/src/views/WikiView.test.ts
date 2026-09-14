@@ -3,7 +3,7 @@
 // 联动：点树/图谱节点 openPage；编辑器 update → store.edit（防抖自动保存）；切容器 switchContainer。
 // store 用真 Pinia（api/wiki mock 替身）；子组件 stub 聚焦组装逻辑。
 import { flushPromises, mount } from '@vue/test-utils'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createPinia, setActivePinia } from 'pinia'
 
 vi.mock('@/api/wiki', () => ({
@@ -213,6 +213,55 @@ describe('WikiView', () => {
     mountView()
     await flushPromises()
     expect(ElMessage.error).toHaveBeenCalledWith('容器不可访问')
+  })
+})
+
+describe('WikiView — #668 面板三态接线（wiki 文件树）', () => {
+  // 视口宽是全局状态：每个用例后复位，防窄屏用例失败时向后续用例泄漏
+  afterEach(() => {
+    window.innerWidth = 1024
+    globalThis.localStorage.clear()
+  })
+
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    ;(listInstances as ReturnType<typeof vi.fn>).mockResolvedValue(INSTANCES)
+    ;(getTree as ReturnType<typeof vi.fn>).mockResolvedValue(TREE)
+    ;(getGraph as ReturnType<typeof vi.fn>).mockResolvedValue(GRAPH)
+    ;(readPage as ReturnType<typeof vi.fn>).mockResolvedValue({
+      path: 'concepts/a.md', title: 'A', content: '# A',
+    })
+    globalThis.localStorage.clear()
+  })
+
+  it('FileTree 被三态包装接管（panel 根 + inline 态 + slot 内）', async () => {
+    const wrapper = mountView()
+    await flushPromises()
+    const panel = wrapper.find('[data-test="panel"]')
+    expect(panel.exists()).toBe(true)
+    expect(panel.attributes('data-state')).toBe('inline') // collapsed/popped 不持久化：每次进页 inline
+    // 拖宽手柄与折叠按钮就位（三态控件，窄屏才整体消失）
+    expect(wrapper.find('[data-test="drag-handle"]').exists()).toBe(true)
+    expect(wrapper.find('[data-test="collapse-btn"]').exists()).toBe(true)
+    // FileTree 在三态包装的 slot 内
+    expect(panel.element.contains(wrapper.find('[data-test="file-tree"]').element)).toBe(true)
+  })
+
+  it('宽度经 localStorage 恢复（key 按页面+面板隔离，owner 未登录为 signed-out）', async () => {
+    globalThis.localStorage.setItem('researcher:panel:signed-out:wiki:file-tree:width', '400')
+    const wrapper = mountView()
+    await flushPromises()
+    expect(wrapper.find('[data-test="panel"]').attributes('style')).toContain('width: 400px')
+  })
+
+  it('窄屏 (<720px) 三态整体禁用：无手柄无按钮，树照常渲染', async () => {
+    window.innerWidth = 500
+    const wrapper = mountView()
+    await flushPromises()
+    expect(wrapper.find('[data-test="panel"]').attributes('data-state')).toBe('disabled')
+    expect(wrapper.find('[data-test="drag-handle"]').exists()).toBe(false)
+    expect(wrapper.find('[data-test="collapse-btn"]').exists()).toBe(false)
+    expect(wrapper.find('[data-test="file-tree"]').exists()).toBe(true)
   })
 })
 

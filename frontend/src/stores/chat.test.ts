@@ -160,4 +160,64 @@ describe('chatStore 纯 mutation', () => {
     chat.removeSession('sk-1')
     expect(chat.sessions.map((s) => s.session_key)).toEqual(['sk-2'])
   })
+
+  // #697 fork：prependSession 幂等——同 key 二次插入（fork 成功 prepend 后 refreshSessions
+  // 合并前的重复路径）不得出现两行，且保留既有行字段（refreshSessions 重拉前的权威行不被占位覆盖）。
+  it('#697 prependSession 幂等：同 key 重复插入不重复行，置顶且保留首次字段', () => {
+    const chat = useChatStore()
+    chat.prependSession({ session_key: 'sk-1', title: '权威标题', updated_at: '2026-09-13T00:00:00Z' })
+    chat.prependSession({ session_key: 'sk-fork', title: '', updated_at: '' })
+    // 重复 prepend 同 key（占位行再插一次）：仅一行、置顶，且沿用首次的权威字段
+    chat.prependSession({ session_key: 'sk-1', title: '', updated_at: '' })
+    expect(chat.sessions.map((s) => s.session_key)).toEqual(['sk-fork', 'sk-1'])
+    expect(chat.sessions.find((s) => s.session_key === 'sk-1')?.title).toBe('权威标题')
+  })
+
+  // #694（Codex #703 P1）：ack 回读把网关条目 id 补回本地乐观消息——只认「有该发送键且尚无 entryId
+  // 的 user 消息」。三条守卫各有用例：已有 entryId 不改写（历史翻译的权威值不被回读覆盖）、发送键
+  // 对不上不动、消息已出列（切会话/重建后的旧对象不在投影内）→ 找不到即 no-op。
+  it('#694 markUserEntryId：按发送键回填 entryId；已有 id / 键不符 / 出列消息均不改写', () => {
+    const chat = useChatStore()
+    const sent = newMsg('user', '刚发出的')
+    sent.sendKey = 'run-A'
+    chat.pushMessage(sent)
+    chat.pushMessage(newMsg('assistant'))
+
+    chat.markUserEntryId('run-A', 'entry-p1')
+    expect(chat.messages[0].entryId).toBe('entry-p1')
+
+    chat.markUserEntryId('run-A', 'entry-other') // 已有 entryId：不改写
+    expect(chat.messages[0].entryId).toBe('entry-p1')
+
+    chat.markUserEntryId('run-unknown', 'entry-x') // 发送键对不上：no-op
+    expect(chat.messages.map((m) => m.entryId)).toEqual(['entry-p1', undefined])
+
+    chat.messages[1].sendKey = 'run-B' // assistant 占位即使带同键也不匹配（只认 user）
+    chat.markUserEntryId('run-B', 'entry-b')
+    expect(chat.messages[1].entryId).toBeUndefined()
+
+    const stale = newMsg('user', '旧投影') // 已出列：不在 messages 内 → no-op（不崩）
+    stale.sendKey = 'run-C'
+    chat.markUserEntryId('run-C', 'entry-c')
+    expect(chat.messages.some((m) => m.entryId === 'entry-c')).toBe(false)
+  })
+})
+
+// #698 分支菜单：branches 是会话级渲染投影（贴 sessions 先例），随 resetForSession /
+// resetForContainer 清空——分支属于单个会话，切会话/容器不得残留旧值（length 门会误渲染按钮）。
+describe('chatStore branches（#698 分支菜单）', () => {
+  it('setBranches 整替 + resetForSession / resetForContainer 清空', () => {
+    const chat = useChatStore()
+    const b = [{ leafEntryId: 'leaf-1', headline: 'A', messageCount: 2, active: true }]
+    chat.setBranches(b)
+    expect(chat.branches).toEqual(b)
+    chat.setBranches([]) // 整替（非追加）：重拉后旧列表不残留
+    expect(chat.branches).toEqual([])
+    chat.setBranches(b)
+    chat.resetForSession()
+    expect(chat.branches).toEqual([]) // 分支随会话换掉
+    chat.setBranches(b)
+    chat.resetForContainer()
+    expect(chat.branches).toEqual([])
+  })
 })

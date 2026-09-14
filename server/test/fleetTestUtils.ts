@@ -25,12 +25,22 @@ export interface FleetTestContext {
 }
 
 // #591：内存 fake FileArchive——编排测试只消费 writeConfig/readConfig（createComplete 落容器内
-// config），文件 CRUD 方法不实现（本域不触达）。
+// config）+ seedWorkspace（#6xx named volume 下模板 workspace 灌卷，断言调用参数与先后顺序），
+// 文件 CRUD 方法不实现（本域不触达）。
 export class MemoryArchive implements FileArchive {
   // name → openclaw.json 文本（静态 config 落点：容器内 ~/.openclaw/openclaw.json）
   readonly configs = new Map<string, string>()
+  // seedWorkspace 调用记录（参数断言）
+  readonly seedCalls: Array<{ name: string; hostDir: string }> = []
+  // 写盘操作序列（seedWorkspace / writeConfig 先后顺序断言）
+  readonly ops: string[] = []
+  async seedWorkspace(name: string, hostDir: string): Promise<void> {
+    this.seedCalls.push({ name, hostDir })
+    this.ops.push('seedWorkspace')
+  }
   async writeConfig(name: string, content: string): Promise<void> {
     this.configs.set(name, content)
+    this.ops.push('writeConfig')
   }
   async readConfig(name: string): Promise<string> {
     const c = this.configs.get(name)
@@ -62,8 +72,11 @@ export function makeFleetTest(
 ): FleetTestContext {
   const fleetRoot = mkdtempSync(path.join(tmpdir(), `fleet-test-${process.pid}-${seq++}-`))
   const templateDir = path.join(fleetRoot, 'template')
-  mkdirSync(path.join(templateDir, 'workspace'), { recursive: true })
+  mkdirSync(path.join(templateDir, 'workspace', 'skills', 'demo'), { recursive: true })
   writeFileSync(path.join(templateDir, 'README.md'), '# home 模板\n')
+  // 模板 workspace 内容（模拟 researcher 各项 md + skills——seedWorkspace 灌卷的源）
+  writeFileSync(path.join(templateDir, 'workspace', 'AGENTS.md'), '# workspace 模板\n')
+  writeFileSync(path.join(templateDir, 'workspace', 'skills', 'demo', 'SKILL.md'), '# demo skill\n')
   const templateJson = path.join(fleetRoot, 'openclaw.template.json')
   writeFileSync(
     templateJson,

@@ -6,7 +6,12 @@
 
 > **2026-08-01 更新**：原校准对象 `2026.6.34-browser` 已被上游从 registry 删除（`manifest unknown`，CI integration 因此全红，issue #302）。最新稳定 `-browser` 变体为 `2026.7.1-browser`（与 `latest-browser` 同 digest；`2026.7.2` 系列仍全为 beta）。本 ADR 决定目标随之更新为 `2026.7.1-browser`，并在该镜像上重验 wire 校准（全绿，无漂移，见下）。
 
-**决定**：把部署与集成测试镜像迁移到 `ghcr.io/openclaw/openclaw:2026.7.1-browser`（官方稳定版 browser 变体；原 `2026.6.34-browser` 因上游删除已废弃）。迁移以「最小 DoD」先行：容器跑起来 + WS connect 握手通过 + 设备配对完成 + 一个 `chat.send` 收到真实事件流（顺带验证 `browser.noSandbox` 能起）；**chat wire schema 校准在官方镜像上做**。
+> **2026-09-12 更新**：部署基线由 `2026.7.1-browser` 前进到 `2026.9.4-browser`——本次是**主动升级**
+（容器升级 epic #682 的版本前提，issue #695），非上游删除驱动；候选版本经
+`docs/research/683-image-upgrade-2026-9.md` 实测筛出（9.4 与 7.1 同属 wire 协议族 `PROTOCOL=4`，
+握手 shape 一致）。本 ADR 决定目标随之更新为 `2026.9.4-browser`，重验见「后果」。
+
+**决定**：把部署与集成测试镜像迁移到 `ghcr.io/openclaw/openclaw:2026.9.4-browser`（官方稳定版 browser 变体；原 `2026.6.34-browser` 因上游删除已废弃，`2026.7.1-browser` 由 issue #695 主动升级取代）；**集成测试的 CI pin 本轮未随迁**（`.github/workflows/ci.yml` 仍 pin `2026.7.1-browser`，见「后果」的「未重验面」）。迁移以「最小 DoD」先行：容器跑起来 + WS connect 握手通过 + 设备配对完成 + 一个 `chat.send` 收到真实事件流（顺带验证 `browser.noSandbox` 能起）；**chat wire schema 校准在官方镜像上做**。
 
 **为什么**：
 - browser 能力是产品需求，fork 镜像给不了（无 Playwright），官方 `-browser` 变体是唯一稳健路径。
@@ -48,6 +53,16 @@
   - **拆 ticket 后续回写**（避免本 PR 膨胀）：工具翻译重构、approval card 字段路径、resolve 方法名/params、`APPROVAL_RESOLVED_EVENTS` 补 exec —— 每项一个 TDD fix。
 - **browser 免 SYS_ADMIN**：官方 browser 变体用 Playwright + Xvfb + `noSandbox`，hardened compose 已 drop `NET_RAW`/`NET_ADMIN`，**不需要 `SYS_ADMIN` cap**（与 fork 的 caps 设计无关，是独立利好）。
 - **`2026.7.1-browser` 重验（2026-08-01, CI integration job, 真容器）**：上游删除 `2026.6.34-browser` 后全仓升级到 `2026.7.1-browser`（PR #299 `6be88d0`）。CI integration 三 job 全绿——**wire schema 校准在 7.1 上无漂移**：T1-T5（`chat.send` 事件流 / 只读 RPC / approval 路径）、`event_translate` 的 `deltaText`/`state:final`/工具帧、`request_router` 的 `exec.approval.resolve` 方法名、`pairing_ws` 嵌套错误码均仍通过，无需修改任何校准代码。7.1 与 6.34 同属 wire 协议族（`PROTOCOL=4`），本 ADR 的 spike 实测结论（token 占位 / SecretRef / 配对 / 工具事件结构）对 7.1 继续成立。
+- **`2026.9.4-browser` 重验（2026-09-12, 本机门控 smoke + 派生镜像本地构建, 真容器）**：两套 smoke 的
+  缺省常量仍 pin `2026.7.1-browser`（见下「未重验面」），故本次**显式**设
+  `OPENCLAW_IMAGE=ghcr.io/openclaw/openclaw:2026.9.4-browser` 覆盖后再跑——9.4 基线上
+  `containers-smoke`（5/5）与 `pairingSmoke`（3/3）全绿：配对闭环（bootstrap → `PAIRING_REQUIRED` →
+  approve → deviceToken 直连）与既有 wire 行为无漂移；派生镜像（`deploy/openclaw-image/`，`FROM` 已
+  bump 至 9.4，issue #695）在该基线上构建通过全部构建期断言（`pdftotext` 可用 + 12 个骨架文件齐全）。
+  **未重验面（如实记录）**：CI `server` job 的两个 smoke 仍 pin `2026.7.1-browser`
+  （`.github/workflows/ci.yml` 的 `OPENCLAW_IMAGE`，注释理由：CI 阶段派生镜像尚不存在、smoke 测编排
+  逻辑，官方/派生镜像等价；本地缺省常量同源），故「wire schema 校准在 9.4 上无漂移」尚未由 CI
+  确认——切换该 pin 属 epic #682 的后续范围，不在 #695 内。
 - **历史实测文档须重验**：R6（挂载契约）、`r26`（ws 协议/operator scope 来自配对）、`r28`（热加载不重启）均基于 fork + init.sh，迁移后须在新镜像上重新验证回填。
 - **配置小坑**：`openclaw.json:33` `browser.executablePath:"/usr/bin/chromium"` 需对齐 Playwright 路径（`/home/node/.cache/ms-playwright`）或删除让其自解析。
 - 本 ADR 与 [0001-persistent-credential-encryption](./0001-persistent-credential-encryption.md) 相关：LLM key 注入方式若从 SecretRef 改为 auth-profiles，必须守住 0001 的"凭证不落明文"不变量（经 env/SecretRef 读，不写盘）。

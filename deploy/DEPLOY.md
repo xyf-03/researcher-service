@@ -25,6 +25,9 @@ panel-frontend 容器（nginx，唯一对宿主暴露，loopback:18080）
 - 前端为 origin-relative：构建不注入后端地址，无 CORS、无 per-domain 重建。
 - 镜像存私有 GHCR：`ghcr.io/<owner>/<repo>/{server,frontend,openclaw,autofigure}`，tag `:latest` +
   `:<commit sha>`（openclaw 为派生镜像 issue #588，autofigure 为 AutoFigure sidecar T08/T11）。
+  openclaw 另推**版本 tag**（`:<Dockerfile FROM 基线 tag>`，issue #695）——**面板 fleet 的目标镜像
+  钉的就是它**（server 镜像内 `config.ts` 默认值同版本），**一经发布不可移动**（换内容 bump 版本；
+  回滚走 `:<sha>`），约定与本地打 tag 见 `deploy/README.md`「派生镜像版本 tag 约定」。
 - **超时分层**：`/api/` 慢请求（创建容器、配对等）依赖代理链逐层放宽超时。容器内 nginx 已配
   `proxy_read_timeout/send_timeout 300s`（`/api/`）与 `3600s`（`/ws/`）；**BaoTa 边缘反代须 ≥ 内层
   最慢值 `3600s`**：站点 → 反向代理 → 配置，填 `proxy_read_timeout 3600s;` + `proxy_send_timeout 3600s;`
@@ -36,7 +39,8 @@ panel-frontend 容器（nginx，唯一对宿主暴露，loopback:18080）
 每次 CI 在 `master` 上成功后自动：
 
 1. 构建 + 推送 `server`、`frontend`、`openclaw`（派生）、`autofigure`（AutoFigure sidecar，T08/T11）
-   四镜像到 GHCR（`:latest` 与 `:<CI head_sha>`）。server 镜像构建期 clone researcher home 模板并连同
+   四镜像到 GHCR（`:latest` 与 `:<CI head_sha>`）；`openclaw` 另推版本 tag（版本从派生 Dockerfile
+   的 `FROM` 行单源提取，issue #695）。server 镜像构建期 clone researcher home 模板并连同
    `deploy/openclaw.json` 经 buildx 多 context 拷入镜像（ADR 0013：#593 模板入镜像，模板随镜像
    `:sha` 版本化）。autofigure 构建源为 `deploy/autofigure-sidecar`（vendored T08 源，**不 fetch
    mutable upstream**），许可/署名文件构建期入镜像（Dockerfile 构建期断言，缺失即 CD 红）。
@@ -103,6 +107,10 @@ python3 -c "import base64,os;print(base64.urlsafe_b64encode(os.urandom(32)).deco
 `OPENCLAW_FLEET_ROOT`（compose 固定 `/fleet`，server 容器内工作目录，无宿主挂载）·
 `DATABASE_URL`（compose 固定 `file:/app/db/db.sqlite3`，指向 panel-db 卷）。
 
+> **`OPENCLAW_IMAGE` 不在上列**：它有缺省值（= 派生镜像钉版本 tag），缺省并不拒启动——但
+> **生产浮动 tag（无 tag 或 `:latest`）→ 启动 fail-fast**（#695，准据 `server/src/config.ts` 的
+> `readFleetImage`；与 `server/README.md` 同处置）。
+
 > 说明：`OPENCLAW_TEMPLATE_DIR` / `OPENCLAW_TEMPLATE_JSON` 都指向 **server 镜像内**路径（ADR 0013
 > `#593` 模板入镜像）。镜像内默认路径 `<cwd>/../deploy/openclaw.json` 解析到 `/app/../deploy`
 > 不存在——compose 显式 pin 到镜像内 COPY 产物，首次创建容器不再 90003。镜像外唯一的宿主数据
@@ -162,6 +170,10 @@ docker compose -f docker-compose.deploy.yml --env-file .env up -d
 ```
 
 （或在 CI 重跑对应历史 commit 的 CD。）
+
+> 面板 fleet 的目标镜像不随部署自动切换：它钉在 server 镜像内的 `config.ts` 默认值（= 派生镜像
+> 版本 tag，issue #695）。存量容器何时/如何换到新目标由容器升级编排决定（#682 epic），生产禁浮动
+> tag 的 fail-fast 见上方「运行时 server 必需 env」的 `OPENCLAW_IMAGE` 说明。
 
 ## 排障
 

@@ -2,7 +2,7 @@
 // 覆盖：ChatSidebar 容器/会话渲染 + emits；ChatComposer 输入 v-model + 发送禁用门 + slash-menu slot；
 // ChatMessageItem thinking/tool-line slot 透传 + 光标；ApprovalCard resolve emits + 已解决态；
 // ChatStream 消息流渲染 + 自动滚动（ADR 0014 审批卡撤离时间线；#400 范式 B + rAF 节流）。
-import { describe, expect, it, vi, afterEach } from 'vitest'
+import { describe, expect, it, vi, afterEach, beforeEach } from 'vitest'
 import { mount } from '@vue/test-utils'
 import { nextTick, reactive } from 'vue'
 import { newMsg, type ApprovalItem, type Msg } from '@/stores/chat'
@@ -10,9 +10,11 @@ import ChatSidebar from '@/components/chat/ChatSidebar.vue'
 import ChatHeader from '@/components/chat/ChatHeader.vue'
 import ChatComposer from '@/components/chat/ChatComposer.vue'
 import ChatMessageItem from '@/components/chat/ChatMessageItem.vue'
+import TraceFold from '@/components/chat/TraceFold.vue'
 import ApprovalCard from '@/components/chat/ApprovalCard.vue'
 import ApprovalDock from '@/components/chat/ApprovalDock.vue'
 import ChatStream from '@/components/chat/ChatStream.vue'
+import AnchorRail from '@/components/chat/AnchorRail.vue'
 
 const INSTANCE = {
   name: 'demo',
@@ -406,6 +408,191 @@ describe('ToolGroup', () => {
   })
 })
 
+// T1 轮次折叠（#664）：TraceFold 条面哑组件——计数文案 + 点击开合 emit（props-in/emits-out）。
+// 时长格式化（后续票）不单开纯函数测试，经条面文案断言。
+describe('TraceFold', () => {
+  it('条面计数文案：思考+工具 → 「执行过程 · 思考 · N 次工具」', () => {
+    const w = mount(TraceFold, { props: { hasThinking: true, toolCount: 5, folded: true } })
+    expect(w.get('[data-test="trace-fold-label"]').text()).toBe('执行过程 · 思考 · 5 次工具')
+  })
+  it('纯思考轮按实际内容计数：「执行过程 · 思考」', () => {
+    const w = mount(TraceFold, { props: { hasThinking: true, toolCount: 0, folded: true } })
+    expect(w.get('[data-test="trace-fold-label"]').text()).toBe('执行过程 · 思考')
+  })
+  it('纯工具轮按实际内容计数：思考段省略', () => {
+    const w = mount(TraceFold, { props: { hasThinking: false, toolCount: 3, folded: true } })
+    expect(w.get('[data-test="trace-fold-label"]').text()).toBe('执行过程 · 3 次工具')
+  })
+  it('点击条面 → emit toggle（开合由父层落 store）', async () => {
+    const w = mount(TraceFold, { props: { hasThinking: true, toolCount: 1, folded: true } })
+    await w.get('[data-test="trace-fold"]').trigger('click')
+    expect(w.emitted('toggle')).toBeTruthy()
+  })
+})
+
+// T2 执行时长（#665）：条面文案升级——有时长主文案「已执行 42s」（≥60s 中文分秒）+ 次要计数；
+// 无时长数据（历史轮）回退「执行过程」计数文案。时长格式化经条面文案断言（spec 决议：不新增
+// 纯函数测试接缝）。
+describe('TraceFold 执行时长（#665 T2）', () => {
+  it('不足 60s：「已执行 42s · 思考 · 5 次工具」（42s 边界）', () => {
+    const w = mount(TraceFold, { props: { hasThinking: true, toolCount: 5, folded: true, turnDurationMs: 42_000 } })
+    expect(w.get('[data-test="trace-fold-label"]').text()).toBe('已执行 42s · 思考 · 5 次工具')
+  })
+  it('≥60s：「已执行 1 分 12 秒 · 思考 · 5 次工具」（1 分 12 秒边界）', () => {
+    const w = mount(TraceFold, { props: { hasThinking: true, toolCount: 5, folded: true, turnDurationMs: 72_000 } })
+    expect(w.get('[data-test="trace-fold-label"]').text()).toBe('已执行 1 分 12 秒 · 思考 · 5 次工具')
+  })
+  it('整分钟省略秒段：60s → 「已执行 1 分 · …」（60s 边界）', () => {
+    const w = mount(TraceFold, { props: { hasThinking: true, toolCount: 5, folded: true, turnDurationMs: 60_000 } })
+    expect(w.get('[data-test="trace-fold-label"]').text()).toBe('已执行 1 分 · 思考 · 5 次工具')
+  })
+  it('纯工具轮带时长：计数段按实际内容（无思考段）', () => {
+    const w = mount(TraceFold, { props: { hasThinking: false, toolCount: 3, folded: true, turnDurationMs: 42_000 } })
+    expect(w.get('[data-test="trace-fold-label"]').text()).toBe('已执行 42s · 3 次工具')
+  })
+  it('无时长数据（durationMs 缺省，历史轮）回退「执行过程」计数文案，不显示「已执行」', () => {
+    const w = mount(TraceFold, { props: { hasThinking: true, toolCount: 5, folded: true, turnDurationMs: undefined } })
+    expect(w.get('[data-test="trace-fold-label"]').text()).toBe('执行过程 · 思考 · 5 次工具')
+  })
+})
+
+// T1 轮次折叠（#664）：折叠条渲染规则（ChatMessageItem 集成，展示接缝）——
+// 折叠态只渲染条面（正文/附件/AI 提示条恒在外）；展开态平铺思考卡+逐行工具行（无分组二级聚合）；
+// 无轨迹不渲染；流式进行中现状渲染不动。
+describe('ChatMessageItem 轮次折叠（#664 T1）', () => {
+  // 构造一条完成且带轨迹（思考 + 2 工具行）的 assistant 消息
+  function tracedAssistant(): Msg {
+    const m = newMsg('assistant', '总结正文')
+    m.streaming = false
+    m.thinking = '思考内容'
+    m.tools.push({ id: 't1', name: 'bash', state: 'done', title: null, input: { command: 'ls' }, result: '' })
+    m.tools.push({ id: 't2', name: 'read', state: 'done', title: null, input: { file_path: '/a.ts' }, result: '' })
+    return m
+  }
+
+  it('折叠态只渲染条面（思考卡/工具行不渲染）；正文、附件、AI 提示条仍可见', () => {
+    const m = tracedAssistant()
+    m.traceFolded = true
+    m.media.push({ type: 'image', mimeType: 'image/png', src: 'AAA' })
+    const w = mount(ChatMessageItem, { props: { msg: m } })
+    expect(w.find('[data-test="trace-fold"]').exists()).toBe(true) // 条面在
+    expect(w.get('[data-test="trace-fold-label"]').text()).toBe('执行过程 · 思考 · 2 次工具')
+    expect(w.find('[data-test="cot-card"]').exists()).toBe(false) // 轨迹收起
+    expect(w.find('[data-test="tool-line"]').exists()).toBe(false)
+    expect(w.text()).toContain('总结正文') // 正文恒在外
+    expect(w.find('[data-test="media-image"]').exists()).toBe(true) // 附件恒在外
+    expect(w.find('[data-test="ai-notice"]').text()).toContain('内容由 AI 生成') // AI 提示条恒在外
+  })
+
+  it('展开态平铺思考卡 + 逐行工具行（无工具分组 details）；条面仍在、可再收起', async () => {
+    const m = tracedAssistant()
+    m.traceFolded = false
+    const w = mount(ChatMessageItem, { props: { msg: m } })
+    expect(w.find('[data-test="trace-fold"]').exists()).toBe(true) // 条面仍在（可再收起）
+    expect(w.find('[data-test="cot-card"]').text()).toContain('思考内容') // 思考卡平铺
+    // 2 个工具行平铺直渲染，绕过 >=2 工具的分组聚合 details（单层展开）
+    expect(w.find('[data-test="tool-group"]').exists()).toBe(false)
+    expect(w.findAll('[data-test="tool-line"]')).toHaveLength(2)
+    await w.get('[data-test="trace-fold"]').trigger('click')
+    expect(w.emitted('toggleTraceFold')).toBeTruthy() // 可再收起（emit 回父层落 store）
+  })
+
+  it('点击折叠条 → emit toggleTraceFold（父层落 store mutation）', async () => {
+    const m = tracedAssistant()
+    m.traceFolded = true
+    const w = mount(ChatMessageItem, { props: { msg: m } })
+    await w.get('[data-test="trace-fold"]').trigger('click')
+    expect(w.emitted('toggleTraceFold')).toBeTruthy()
+  })
+
+  it('无轨迹（思考空且无工具）的完成消息不渲染折叠条', () => {
+    const m = newMsg('assistant', '纯文本回复')
+    m.streaming = false
+    const w = mount(ChatMessageItem, { props: { msg: m } })
+    expect(w.find('[data-test="trace-fold"]').exists()).toBe(false)
+  })
+
+  it('纯思考轮照常渲染折叠条（计数文案无工具段）', () => {
+    const m = newMsg('assistant', '正文')
+    m.streaming = false
+    m.thinking = '只有思考'
+    const w = mount(ChatMessageItem, { props: { msg: m } })
+    expect(w.get('[data-test="trace-fold-label"]').text()).toBe('执行过程 · 思考')
+  })
+
+  it('纯工具轮照常渲染折叠条（单工具直接平铺）', () => {
+    const m = newMsg('assistant', '正文')
+    m.streaming = false
+    m.tools.push({ id: 't1', name: 'bash', state: 'done', title: null, input: { command: 'ls' }, result: '' })
+    const w = mount(ChatMessageItem, { props: { msg: m } })
+    expect(w.get('[data-test="trace-fold-label"]').text()).toBe('执行过程 · 1 次工具')
+  })
+
+  it('traceFolded 缺省（undefined，error/断线/宽限收尾轮不置折叠态）→ 条面渲染且轨迹展开可见（缺省即展开）', () => {
+    const m = tracedAssistant() // 不设 traceFolded——异常收尾轮同形态
+    const w = mount(ChatMessageItem, { props: { msg: m } })
+    expect(w.find('[data-test="trace-fold"]').exists()).toBe(true)
+    expect(w.find('[data-test="cot-card"]').exists()).toBe(true) // 条目展开（无「箭头闭合却展开」矛盾态）
+    expect(w.findAll('[data-test="tool-line"]')).toHaveLength(2)
+    expect(w.find('[data-test="tool-group"]').exists()).toBe(false) // 折叠条场景绕过分组聚合
+  })
+
+  // T3 历史轮默认折叠（#666）：历史翻译产物形态 = traceFolded=true + turnDurationMs 缺省。
+  it('历史翻译消息形态（traceFolded=true、无时长数据）→ 默认折叠：条面步骤计数无「已执行」，轨迹收起、正文在外', () => {
+    const m = tracedAssistant()
+    m.traceFolded = true // #666 起 loadHistory/外来 final 插入的翻译产物同形态（时长恒缺省）
+    const w = mount(ChatMessageItem, { props: { msg: m } })
+    const label = w.get('[data-test="trace-fold-label"]').text()
+    expect(label).toBe('执行过程 · 思考 · 2 次工具') // 步骤计数（无时长数据回退文案）
+    expect(label).not.toContain('已执行') // 历史轮不显示执行时长
+    expect(w.find('[data-test="cot-card"]').exists()).toBe(false) // 轨迹默认收起
+    expect(w.find('[data-test="tool-line"]').exists()).toBe(false)
+    expect(w.text()).toContain('总结正文') // 正文恒在折叠外
+  })
+
+  it('历史折叠条手动开合与实时轮一致：折叠态点击 → emit toggleTraceFold；展开态单层平铺（无分组）', async () => {
+    const m = tracedAssistant()
+    m.traceFolded = true // 历史默认折叠态
+    const w = mount(ChatMessageItem, { props: { msg: m } })
+    await w.get('[data-test="trace-fold"]').trigger('click')
+    expect(w.emitted('toggleTraceFold')).toBeTruthy() // 与实时轮同一开合链路（→父层落 store）
+    // 展开态（store mutation 后 traceFolded=false）：平铺思考卡 + 逐行工具行，无二级聚合
+    const w2 = mount(ChatMessageItem, { props: { msg: { ...m, traceFolded: false } } })
+    expect(w2.find('[data-test="trace-fold"]').exists()).toBe(true) // 条面仍在（可再收起）
+    expect(w2.find('[data-test="cot-card"]').exists()).toBe(true)
+    expect(w2.findAll('[data-test="tool-line"]')).toHaveLength(2)
+    expect(w2.find('[data-test="tool-group"]').exists()).toBe(false)
+  })
+
+  it('完成轮带执行时长（msg.turnDurationMs）→ 条面显示「已执行 …」（#665 prop 传递）', () => {
+    const m = tracedAssistant()
+    m.turnDurationMs = 42_000
+    const w = mount(ChatMessageItem, { props: { msg: m } })
+    expect(w.get('[data-test="trace-fold-label"]').text()).toBe('已执行 42s · 思考 · 2 次工具')
+  })
+
+  it('流式进行中渲染现状不动：无折叠条，思考卡 + >=2 工具分组聚合照旧', () => {
+    const m = tracedAssistant()
+    m.streaming = true // 流式中
+    m.traceFolded = undefined
+    const w = mount(ChatMessageItem, { props: { msg: m } })
+    expect(w.find('[data-test="trace-fold"]').exists()).toBe(false) // 不渲染折叠条
+    expect(w.find('[data-test="cot-card"]').exists()).toBe(true) // 思考卡照旧
+    expect(w.find('[data-test="tool-group"]').exists()).toBe(true) // 既有分组聚合照旧
+    expect(w.findAll('[data-test="tool-line"]')).toHaveLength(2)
+  })
+
+  it('ChatStream 转发 toggleTraceFold（携带所属消息，供父层落 store）', async () => {
+    const m = tracedAssistant()
+    m.traceFolded = true
+    const w = mount(ChatStream, {
+      props: { messages: [m], historyHasMore: false, historyLoading: false },
+    })
+    await w.get('[data-test="trace-fold"]').trigger('click')
+    expect(w.emitted('toggleTraceFold')?.[0]).toEqual([m])
+  })
+})
+
 // 审批卡测试与 ChatStream 合并时间线测试共用的卡片基底
 const card: ApprovalItem = {
   id: 'a1',
@@ -700,5 +887,601 @@ describe('ChatStream 自动滚动（ADR 0009 / #400 范式 B + rAF 节流）', (
     expect(rafSpy).toHaveBeenCalledTimes(1)
     await tick()
     expect(stream.scrollTop).toBe(0) // 无内容可滚，scrollTop 恒 0（赋值被浏览器 clamp）
+  })
+})
+
+// ---- 消息锚点导航（issue #669 / #667 spec）：AnchorRail 刻度轨哑组件 ----
+describe('AnchorRail（锚点刻度轨，props-in/emits-out 哑组件）', () => {
+  const anchors = [
+    { index: 0, ratio: 0, summary: '第一条输入' },
+    { index: 2, ratio: 0.5, summary: '中间那条输入，比较长会被截断…' },
+    { index: 5, ratio: 1, summary: '[图片]' },
+  ]
+  const baseProps = { anchors, activeIndex: -1, railHeight: 400 }
+
+  it('刻度数 = anchors 数；top 按比例分布；aria-label 带摘要', () => {
+    const w = mount(AnchorRail, { props: baseProps })
+    const dots = w.findAll('[data-test^="anchor-dot-"]')
+    expect(dots).toHaveLength(3)
+    expect(dots[0].attributes('style')).toContain('top: 0%')
+    expect(dots[1].attributes('style')).toContain('top: 50%')
+    expect(dots[2].attributes('style')).toContain('top: 100%')
+    expect(dots[0].attributes('aria-label')).toBe('第一条输入')
+  })
+
+  it('轨高 = 宿主注入的 railHeight（sticky 0 高占位包含块不可用 %，须显式 px）', () => {
+    const w = mount(AnchorRail, { props: { ...baseProps, railHeight: 480 } })
+    expect(w.get('[data-test="anchor-rail"]').attributes('style')).toContain('height: 480px')
+  })
+
+  it('hover 刻度 → 显示摘要 tooltip；移出 → 隐藏', async () => {
+    const w = mount(AnchorRail, { props: baseProps })
+    expect(w.find('[data-test="anchor-tip-5"]').exists()).toBe(false)
+    await w.find('[data-test="anchor-dot-5"]').trigger('mouseenter')
+    expect(w.find('[data-test="anchor-tip-5"]').text()).toBe('[图片]')
+    await w.find('[data-test="anchor-dot-5"]').trigger('mouseleave')
+    expect(w.find('[data-test="anchor-tip-5"]').exists()).toBe(false)
+  })
+
+  it('点击刻度 → emits jump 带锚定消息下标', async () => {
+    const w = mount(AnchorRail, { props: baseProps })
+    await w.find('[data-test="anchor-dot-5"]').trigger('click')
+    expect(w.emitted('jump')?.[0]).toEqual([5])
+  })
+
+  it('activeIndex 匹配的刻度有 active 态（scrollspy 指示）', () => {
+    const w = mount(AnchorRail, { props: { ...baseProps, activeIndex: 1 } })
+    expect(w.find('[data-test="anchor-dot-0"]').classes()).not.toContain('active')
+    expect(w.find('[data-test="anchor-dot-2"]').classes()).toContain('active')
+    expect(w.find('[data-test="anchor-dot-5"]').classes()).not.toContain('active')
+  })
+
+  it('无锚点 → 轨不渲染', () => {
+    const w = mount(AnchorRail, { props: { ...baseProps, anchors: [] } })
+    expect(w.find('[data-test="anchor-rail"]').exists()).toBe(false)
+  })
+})
+
+// ---- 消息锚点导航（issue #669 / #667 spec）：ChatStream 宿主接线（DOM 度量注入）----
+describe('ChatStream 锚点导航接线（issue #669）', () => {
+  // jsdom 无布局：stream 滚动几何 + 每条消息 offsetTop 全部 stub 注入（贴上方范式 B 测试模式）。
+  let stream: HTMLElement
+  let maxScroll = 0
+  let scrollTopValue = 0
+
+  function stubStreamGeometry(height = 1000, clientHeight = 100) {
+    Object.defineProperty(stream, 'scrollHeight', { configurable: true, value: height })
+    Object.defineProperty(stream, 'clientHeight', { configurable: true, value: clientHeight })
+    maxScroll = height - clientHeight
+    Object.defineProperty(stream, 'scrollTop', {
+      configurable: true,
+      get: () => scrollTopValue,
+      set: (v: number) => {
+        scrollTopValue = Math.min(Math.max(v, 0), maxScroll)
+        stream.dispatchEvent(new Event('scroll')) // 真实浏览器赋值触发 scroll 事件
+      },
+    })
+  }
+
+  // stub 指定消息下标的 offsetTop（度量为相对滚动文档顶部的布局位置）
+  function stubMsgOffsets(w: Awaited<ReturnType<typeof mount>>, offsets: Record<number, number>) {
+    for (const [index, top] of Object.entries(offsets)) {
+      const node = w.get(`[data-index="${index}"]`).element as HTMLElement
+      Object.defineProperty(node, 'offsetTop', { configurable: true, value: top })
+    }
+  }
+
+  const U = (text: string) => newMsg('user', text)
+  const A = (text: string) => {
+    const m = newMsg('assistant', text)
+    m.streaming = false
+    return m
+  }
+
+  it('刻度数 = user 消息数（assistant 不进轨）；轨挂在 stream 内', async () => {
+    const w = mount(ChatStream, {
+      props: { messages: [], historyHasMore: false, historyLoading: false },
+    })
+    stream = w.get('[data-test="stream"]').element as HTMLElement
+    stubStreamGeometry()
+    await w.setProps({ messages: [U('一'), A('答'), U('二'), A('答'), U('三')] })
+    await nextTick()
+    // 刻度按消息下标命名（anchor-dot-<msgIndex>）：1、3 缺席 = assistant 不进轨
+    expect(w.find('[data-test="stream"] [data-test="anchor-dot-0"]').exists()).toBe(true)
+    expect(w.find('[data-test="stream"] [data-test="anchor-dot-1"]').exists()).toBe(false)
+    expect(w.find('[data-test="stream"] [data-test="anchor-dot-2"]').exists()).toBe(true)
+    expect(w.find('[data-test="stream"] [data-test="anchor-dot-3"]').exists()).toBe(false)
+    expect(w.find('[data-test="stream"] [data-test="anchor-dot-4"]').exists()).toBe(true)
+  })
+
+  it('无 user 消息 → 轨不渲染', async () => {
+    const w = mount(ChatStream, {
+      props: { messages: [A('只有回答')], historyHasMore: false, historyLoading: false },
+    })
+    expect(w.find('[data-test="anchor-rail"]').exists()).toBe(false)
+  })
+
+  it('刻度按消息 offsetTop 比例分布（DOM 度量注入）', async () => {
+    const w = mount(ChatStream, {
+      props: { messages: [], historyHasMore: false, historyLoading: false },
+    })
+    stream = w.get('[data-test="stream"]').element as HTMLElement
+    stubStreamGeometry() // maxScroll = 900
+    const msgs = [U('顶'), A('长回答'), U('中'), A('长回答'), U('底')]
+    await w.setProps({ messages: msgs })
+    await nextTick()
+    stubMsgOffsets(w, { 0: 0, 2: 450, 4: 900 })
+    await w.setProps({ messages: [...msgs] }) // 新引用触发重测
+    await nextTick()
+    expect(w.get('[data-test="anchor-dot-0"]').attributes('style')).toContain('top: 0%')
+    expect(w.get('[data-test="anchor-dot-2"]').attributes('style')).toContain('top: 50%')
+    expect(w.get('[data-test="anchor-dot-4"]').attributes('style')).toContain('top: 100%')
+  })
+
+  it('hover 刻度 → 摘要文本（前几十字截断 / 纯媒体占位）', async () => {
+    const long = '长'.repeat(50)
+    const media = U('')
+    media.media.push({ type: 'image', mimeType: 'image/png', src: 'AA==' })
+    const w = mount(ChatStream, {
+      props: { messages: [], historyHasMore: false, historyLoading: false },
+    })
+    stream = w.get('[data-test="stream"]').element as HTMLElement
+    stubStreamGeometry()
+    await w.setProps({ messages: [U(long), A('答'), media] })
+    await nextTick()
+    await w.find('[data-test="anchor-dot-0"]').trigger('mouseenter')
+    expect(w.get('[data-test="anchor-tip-0"]').text()).toBe('长'.repeat(40) + '…')
+    await w.find('[data-test="anchor-dot-2"]').trigger('mouseenter')
+    expect(w.get('[data-test="anchor-tip-2"]').text()).toBe('[图片]')
+  })
+
+  it('点击刻度 → 滚动定位到目标消息 + 目标高亮渐隐', async () => {
+    vi.useFakeTimers()
+    try {
+      const w = mount(ChatStream, {
+        props: { messages: [], historyHasMore: false, historyLoading: false },
+      })
+      stream = w.get('[data-test="stream"]').element as HTMLElement
+      stubStreamGeometry()
+      const msgs = [U('一'), A('答'), U('二')]
+      await w.setProps({ messages: msgs })
+      await nextTick()
+      stubMsgOffsets(w, { 0: 0, 2: 900 })
+      await w.setProps({ messages: [...msgs] })
+      await nextTick()
+      scrollTopValue = 0
+      await w.get('[data-test="anchor-dot-2"]').trigger('click')
+      // 程序性滚动定位到目标消息 offsetTop（经 scroll 事件自然落范式 B 语义）
+      expect(scrollTopValue).toBe(900)
+      // 目标消息高亮
+      expect(w.get('[data-index="2"]').classes()).toContain('anchor-flash')
+      // 1–2s 渐隐：class 移除
+      vi.advanceTimersByTime(2_100)
+      await nextTick()
+      expect(w.find('[data-index="2"]').classes()).not.toContain('anchor-flash')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  // 范式 B 语义保持（#667）：跳转到中部锚点属程序性滚动，经 scroll 事件自然落 stickyBottom=false
+  // → 后续流式追加不抢滚动条（上滚让位），无须新逻辑。
+  it('跳转到中部锚点 → 上滚让位：流式追加不抢滚动条', async () => {
+    const w = mount(ChatStream, {
+      props: { messages: [], historyHasMore: false, historyLoading: false },
+    })
+    stream = w.get('[data-test="stream"]').element as HTMLElement
+    stubStreamGeometry() // scrollHeight=1000、clientHeight=100（maxScroll=900）
+    const msgs = [U('顶'), A('长回答'), U('中')]
+    await w.setProps({ messages: msgs })
+    await nextTick()
+    stubMsgOffsets(w, { 0: 0, 2: 450 })
+    await w.setProps({ messages: [...msgs] })
+    await nextTick()
+    scrollTopValue = 900 // 从底部起跳（stickyBottom=true）
+    stream.dispatchEvent(new Event('scroll'))
+    await w.get('[data-test="anchor-dot-2"]').trigger('click')
+    expect(scrollTopValue).toBe(450) // 定位到中部锚点
+    expect(scrollTopValue - maxScroll).toBe(-450) // 距底 450 > 阈值
+    // 追加流式新消息（底部有新内容）→ 范式 B 让位：不自动滚底
+    await w.setProps({ messages: [...msgs, A('新回答')] })
+    await nextTick()
+    expect(scrollTopValue).toBe(450)
+  })
+
+  it('内容不足一屏（无滚动空间）→ 轨隐藏', async () => {
+    const w = mount(ChatStream, {
+      props: { messages: [], historyHasMore: false, historyLoading: false },
+    })
+    stream = w.get('[data-test="stream"]').element as HTMLElement
+    stubStreamGeometry(400, 800) // scrollHeight < clientHeight：一屏全见，无需导航
+    await w.setProps({ messages: [U('短内容'), A('答')] })
+    await nextTick()
+    expect(w.find('[data-test="anchor-rail"]').exists()).toBe(false)
+  })
+
+  it('scrollspy：滚动时刻度指示当前位置（active 刻度）', async () => {
+    const w = mount(ChatStream, {
+      props: { messages: [], historyHasMore: false, historyLoading: false },
+    })
+    stream = w.get('[data-test="stream"]').element as HTMLElement
+    stubStreamGeometry() // maxScroll=900；刻度 [0, .5, 1]
+    const msgs = [U('顶'), A('答'), U('中'), A('答'), U('底')]
+    await w.setProps({ messages: msgs })
+    await nextTick()
+    stubMsgOffsets(w, { 0: 0, 2: 450, 4: 900 })
+    await w.setProps({ messages: [...msgs] })
+    await nextTick()
+    scrollTopValue = 810 // indicator = .9 → 最近刻度 1（index=4 消息）
+    stream.dispatchEvent(new Event('scroll'))
+    await nextTick()
+    expect(w.get('[data-test="anchor-dot-4"]').classes()).toContain('active')
+    scrollTopValue = 90 // indicator = .1 → 最近刻度 0（index=0 消息）
+    stream.dispatchEvent(new Event('scroll'))
+    await nextTick()
+    expect(w.get('[data-test="anchor-dot-0"]').classes()).toContain('active')
+    expect(w.get('[data-test="anchor-dot-4"]').classes()).not.toContain('active')
+  })
+
+  it('「加载更多」后锚点增长（prepend 消息 → 刻度重测）', async () => {
+    const initial = [U('已有'), A('答')]
+    const w = mount(ChatStream, {
+      props: { messages: initial, historyHasMore: true, historyLoading: false },
+    })
+    stream = w.get('[data-test="stream"]').element as HTMLElement
+    stubStreamGeometry()
+    await w.setProps({ messages: [...initial] }) // 新引用触发重测（jsdom 度量注入后）
+    await nextTick()
+    expect(w.find('[data-test="anchor-dot-0"]').exists()).toBe(true)
+    expect(w.find('[data-test="anchor-dot-2"]').exists()).toBe(false)
+    // 加载更多：更旧消息 prepend 到头部
+    await w.setProps({ messages: [U('更旧'), U('旧'), A('答'), U('已有'), A('答')] })
+    await nextTick()
+    expect(w.find('[data-test="anchor-dot-0"]').exists()).toBe(true)
+    expect(w.find('[data-test="anchor-dot-1"]').exists()).toBe(true)
+    expect(w.find('[data-test="anchor-dot-3"]').exists()).toBe(true)
+  })
+
+  it('切会话/容器（messages 清空）→ 轨重置消失', async () => {
+    const initial = [U('一'), A('答')]
+    const w = mount(ChatStream, {
+      props: { messages: initial, historyHasMore: false, historyLoading: false },
+    })
+    stream = w.get('[data-test="stream"]').element as HTMLElement
+    stubStreamGeometry()
+    await w.setProps({ messages: [...initial] }) // 新引用触发重测（jsdom 度量注入后）
+    await nextTick()
+    expect(w.find('[data-test="anchor-rail"]').exists()).toBe(true)
+    await w.setProps({ messages: [] })
+    await nextTick()
+    expect(w.find('[data-test="anchor-rail"]').exists()).toBe(false)
+  })
+})
+
+// #694 回退入口与确认 popover（#693 spec §1.5 / §685 官方形态还原）：入口只对「已持久化的 user
+// 消息」渲染（有网关条目 id），agent 工作中 / 会话控制不可用时整体隐藏；确认 popover 含取消与
+// 「不再询问」，勾选后偏好落 localStorage（官方同 key），下次直接执行不再询问。
+describe('#694 回退入口与确认 popover', () => {
+  const userWithEntry = (text = '第一问') => {
+    const m = newMsg('user', text)
+    m.entryId = 'entry-1'
+    return m
+  }
+
+  beforeEach(() => {
+    localStorage.clear()
+  })
+
+  // 挂载助手：rewindAvailable 缺省 false（能力门 fail-closed）——本组用例默认显式开门，
+  // 门本身的行为由下方专门用例断言。attachTo 才挂进文档（jsdom 的 focus/几何都需要元素在文档里）。
+  const mountItem = (msg: Msg, props: Record<string, unknown> = {}, attachTo?: HTMLElement) =>
+    mount(ChatMessageItem, {
+      props: { msg, rewindAvailable: true, ...props },
+      ...(attachTo ? { attachTo } : {}),
+    })
+
+  it('已持久化 user 消息（有 entryId）→ hover 操作条渲染「回退」入口', () => {
+    const w = mountItem(userWithEntry())
+    expect(w.find('[data-test="msg-actions"]').exists()).toBe(true)
+    expect(w.get('[data-test="rewind"]').text()).toBe('回退')
+    expect(w.get('[data-test="rewind"]').attributes('aria-label')).toBe('Rewind') // aria 保持英文
+  })
+
+  it('无 entryId（本地乐观 echo / 异常形状）→ 不渲染任何消息级操作入口', () => {
+    const w = mountItem(newMsg('user', '刚发出还没落库'))
+    expect(w.find('[data-test="msg-actions"]').exists()).toBe(false)
+  })
+
+  it('assistant 消息即使有 entryId 也无回退入口（回退只针对用户消息）', () => {
+    const m = newMsg('assistant', '回答')
+    m.streaming = false
+    m.entryId = 'entry-2'
+    const w = mountItem(m)
+    expect(w.find('[data-test="msg-actions"]').exists()).toBe(false)
+  })
+
+  it('agent 工作中 / 会话控制不可用（rewindAvailable=false）→ 入口整体隐藏（非禁用态）', () => {
+    const w = mountItem(userWithEntry(), { rewindAvailable: false })
+    expect(w.find('[data-test="rewind"]').exists()).toBe(false)
+  })
+
+  it('未传 rewindAvailable（宿主没开门）→ 入口隐藏（fail-closed）', () => {
+    const w = mount(ChatMessageItem, { props: { msg: userWithEntry() } })
+    expect(w.find('[data-test="msg-actions"]').exists()).toBe(false)
+  })
+
+  it('首次点击 → 出确认 popover（危险色确认 + 取消 + 不再询问），此时不触发回退', async () => {
+    const w = mountItem(userWithEntry())
+    await w.get('[data-test="rewind"]').trigger('click')
+    expect(w.find('[data-test="rewind-confirm"]').exists()).toBe(true)
+    expect(w.get('[data-test="rewind-confirm"]').text()).toContain('不再询问')
+    expect(w.get('[data-test="rewind-confirm"]').text()).toContain('剪除') // 确认文案说明后果（破坏性动作）
+    expect(w.get('[data-test="rewind-cancel"]').text()).toBe('取消')
+    expect(w.get('[data-test="rewind-confirm-yes"]').classes()).toContain('danger')
+    expect(w.emitted('rewind')).toBeFalsy() // 未确认不发动作
+  })
+
+  it('焦点：打开即交给确认按钮，关闭后归还触发按钮（键盘可达，非只鼠标可用）', async () => {
+    const w = mountItem(userWithEntry(), {}, document.body)
+    const trigger = w.get('[data-test="rewind"]').element as HTMLButtonElement
+    await w.get('[data-test="rewind"]').trigger('click')
+    expect(document.activeElement).toBe(w.get('[data-test="rewind-confirm-yes"]').element)
+    await w.get('[data-test="rewind-cancel"]').trigger('click')
+    await nextTick()
+    expect(document.activeElement).toBe(trigger)
+    w.unmount()
+  })
+
+  it('确认 → emit rewind（不记住偏好时下次仍询问）', async () => {
+    const w = mountItem(userWithEntry())
+    await w.get('[data-test="rewind"]').trigger('click')
+    await w.get('[data-test="rewind-confirm-yes"]').trigger('click')
+    expect(w.emitted('rewind')).toHaveLength(1)
+    expect(w.find('[data-test="rewind-confirm"]').exists()).toBe(false)
+    expect(localStorage.getItem('openclaw:skip-rewind-confirm')).toBeNull() // 未勾选不落盘
+  })
+
+  it('取消 → 关闭且不 emit（用户可安全退出）', async () => {
+    const w = mountItem(userWithEntry())
+    await w.get('[data-test="rewind"]').trigger('click')
+    await w.get('[data-test="rewind-cancel"]').trigger('click')
+    expect(w.find('[data-test="rewind-confirm"]').exists()).toBe(false)
+    expect(w.emitted('rewind')).toBeFalsy()
+  })
+
+  it('Escape 关闭确认 popover（官方同款关闭路径），不触发回退', async () => {
+    const w = mountItem(userWithEntry())
+    await w.get('[data-test="rewind"]').trigger('click')
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }))
+    await nextTick()
+    expect(w.find('[data-test="rewind-confirm"]').exists()).toBe(false)
+    expect(w.emitted('rewind')).toBeFalsy()
+  })
+
+  it('点击 popover 外部关闭（不误触发回退）', async () => {
+    const w = mountItem(userWithEntry())
+    await w.get('[data-test="rewind"]').trigger('click')
+    document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))
+    await nextTick()
+    expect(w.find('[data-test="rewind-confirm"]').exists()).toBe(false)
+    expect(w.emitted('rewind')).toBeFalsy()
+  })
+
+  it('再点入口 → 收起 popover（官方 toggle 语义；不是「关掉又被重新打开」）', async () => {
+    const w = mountItem(userWithEntry(), {}, document.body)
+    await w.get('[data-test="rewind"]').trigger('click')
+    expect(w.find('[data-test="rewind-confirm"]').exists()).toBe(true)
+    // 真实交互序：按下（mousedown）→ 抬起（click）都落在触发按钮上
+    const btn = w.get('[data-test="rewind"]')
+    btn.element.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))
+    await btn.trigger('click')
+    expect(w.find('[data-test="rewind-confirm"]').exists()).toBe(false)
+    expect(w.emitted('rewind')).toBeFalsy()
+    w.unmount()
+  })
+
+  it('放置：默认上翻；上方放不下（消息贴近滚动容器顶缘）→ 翻到下方（否则确认按钮被 overflow 裁掉不可点）', async () => {
+    // 挂到文档 + 伪造几何：jsdom 无布局，getBoundingClientRect 恒 0——直接 stub 滚动宿主的 top 与按钮 top。
+    const mountWithRoomAbove = async (roomAbove: number) => {
+      const w = mountItem(userWithEntry(), {}, document.body)
+      const host = w.element.parentElement as HTMLElement // 外层容器：注入滚动语义
+      host.style.overflowY = 'auto'
+      host.getBoundingClientRect = () => ({ top: 0 }) as DOMRect
+      const btn = w.get('[data-test="rewind"]').element as HTMLElement
+      btn.getBoundingClientRect = () => ({ top: roomAbove }) as DOMRect
+      await w.get('[data-test="rewind"]').trigger('click')
+      const cls = w.get('[data-test="rewind-confirm"]').classes()
+      w.unmount()
+      return cls
+    }
+
+    expect(await mountWithRoomAbove(200)).toContain('above')
+    expect(await mountWithRoomAbove(2)).toContain('below')
+  })
+
+  it('放置：窄屏左伸空间不足 → 卡片右移夹取在滚动容器内（否则确认按钮被 overflow 裁掉点不到）', async () => {
+    // jsdom 无布局：卡片宽度（offsetWidth）也得伪造——onMounted 里量一次，故在挂载前打好桩。
+    const widthSpy = vi.spyOn(HTMLElement.prototype, 'offsetWidth', 'get').mockReturnValue(232)
+    const styleAt = async (hostLeft: number, hostRight: number, anchorRight: number) => {
+      const w = mountItem(userWithEntry(), {}, document.body)
+      const host = w.element.parentElement as HTMLElement // 外层容器：注入滚动语义
+      host.style.overflowY = 'auto'
+      host.getBoundingClientRect = () => ({ top: 0, left: hostLeft, right: hostRight }) as DOMRect
+      const btn = w.get('[data-test="rewind"]').element as HTMLElement
+      btn.getBoundingClientRect = () => ({ top: 300, right: anchorRight }) as DOMRect
+      await w.get('[data-test="rewind"]').trigger('click')
+      const style = w.get('[data-test="rewind-confirm"]').attributes('style') ?? ''
+      w.unmount()
+      return style
+    }
+
+    try {
+      // 宽屏：操作条在右半区（左伸 468px 远在容器内）→ 维持默认贴右缘，不位移
+      expect(await styleAt(0, 800, 700)).not.toContain('right: -')
+      // 窄屏：user 气泡占满列宽 → 操作条贴左缘（右缘 60px），232px 卡片左伸到 -172px 会被裁 →
+      // 右移到容器左内边距（8px）处，位移 180px（可覆盖气泡，但确认按钮必须可见可点）
+      expect(await styleAt(0, 360, 60)).toContain('right: -180px')
+    } finally {
+      widthSpy.mockRestore()
+    }
+  })
+
+  it('勾选「不再询问」并确认 → 偏好落盘（官方 key）+ 本次回退照常发出', async () => {
+    const w = mountItem(userWithEntry())
+    await w.get('[data-test="rewind"]').trigger('click')
+    await w.get('[data-test="rewind-remember"]').setValue(true)
+    await w.get('[data-test="rewind-confirm-yes"]').trigger('click')
+    expect(w.emitted('rewind')).toHaveLength(1)
+    expect(localStorage.getItem('openclaw:skip-rewind-confirm')).toBe('1')
+  })
+
+  it('已记住偏好 → 点击直接回退，不再弹确认', async () => {
+    localStorage.setItem('openclaw:skip-rewind-confirm', '1')
+    const w = mountItem(userWithEntry())
+    await w.get('[data-test="rewind"]').trigger('click')
+    expect(w.find('[data-test="rewind-confirm"]').exists()).toBe(false)
+    expect(w.emitted('rewind')).toHaveLength(1)
+  })
+
+  it('存储不可用（隐私模式）→ 静默退化为每次确认（不崩）', async () => {
+    const orig = Object.getOwnPropertyDescriptor(globalThis, 'localStorage')
+    Object.defineProperty(globalThis, 'localStorage', {
+      configurable: true,
+      get() {
+        throw new Error('SecurityError')
+      },
+    })
+    try {
+      const w = mountItem(userWithEntry())
+      await w.get('[data-test="rewind"]').trigger('click')
+      expect(w.find('[data-test="rewind-confirm"]').exists()).toBe(true)
+      await w.get('[data-test="rewind-remember"]').setValue(true)
+      await w.get('[data-test="rewind-confirm-yes"]').trigger('click')
+      expect(w.emitted('rewind')).toHaveLength(1)
+    } finally {
+      if (orig) Object.defineProperty(globalThis, 'localStorage', orig)
+    }
+  })
+
+  it('ChatStream 转发 rewind（携带所属消息，父层据此取 entryId）', async () => {
+    const msg = userWithEntry()
+    const w = mount(ChatStream, {
+      props: { messages: [msg], historyHasMore: false, historyLoading: false, rewindAvailable: true },
+    })
+    await w.get('[data-test="rewind"]').trigger('click')
+    await w.get('[data-test="rewind-confirm-yes"]').trigger('click')
+    expect(w.emitted('rewind')?.[0]).toEqual([msg])
+  })
+})
+
+// #697 fork 入口（#693 spec 前端线）：与回退同一条 hover 操作条、同一渲染门（已持久化 user 消息
+// + 能力门），点击**直接 emit**——非破坏性动作（源会话完整保留），无确认 popover、无「不再询问」。
+describe('#697 fork 入口', () => {
+  const userWithEntry = (text = '第一问') => {
+    const m = newMsg('user', text)
+    m.entryId = 'entry-1'
+    return m
+  }
+
+  const mountItem = (msg: Msg, props: Record<string, unknown> = {}) =>
+    mount(ChatMessageItem, { props: { msg, rewindAvailable: true, forkAvailable: true, ...props } })
+
+  it('已持久化 user 消息 → 操作条同时渲染「回退」与「从此分叉」', () => {
+    const w = mountItem(userWithEntry())
+    expect(w.find('[data-test="msg-actions"]').exists()).toBe(true)
+    expect(w.get('[data-test="fork"]').text()).toBe('从此分叉')
+    expect(w.get('[data-test="fork"]').attributes('aria-label')).toBe('Fork')
+  })
+
+  it('无 entryId / assistant 消息 → 无 fork 入口（与回退同一身份门）', () => {
+    const w1 = mountItem(newMsg('user', '没落库'))
+    expect(w1.find('[data-test="fork"]').exists()).toBe(false)
+    const m = newMsg('assistant', '回答')
+    m.streaming = false
+    m.entryId = 'entry-2'
+    const w2 = mountItem(m)
+    expect(w2.find('[data-test="fork"]').exists()).toBe(false)
+  })
+
+  it('forkAvailable=false（能力门关 / 对方 busy）→ fork 入口隐藏（fail-closed，非禁用态）', () => {
+    const w = mountItem(userWithEntry(), { forkAvailable: false })
+    expect(w.find('[data-test="fork"]').exists()).toBe(false)
+    expect(w.find('[data-test="rewind"]').exists()).toBe(true) // 回退门独立（宿主分别开门）
+  })
+
+  it('点击 → 直接 emit fork（免确认：非破坏性，无 popover 分支）', async () => {
+    const w = mountItem(userWithEntry())
+    await w.get('[data-test="fork"]').trigger('click')
+    expect(w.emitted('fork')).toHaveLength(1)
+    expect(w.find('[data-test="rewind-confirm"]').exists()).toBe(false) // 不误触回退确认层
+  })
+
+  it('仅回退可用（forkAvailable 缺省 false）→ 操作条仍渲染回退，不渲染 fork', () => {
+    const w = mount(ChatMessageItem, { props: { msg: userWithEntry(), rewindAvailable: true } })
+    expect(w.find('[data-test="rewind"]').exists()).toBe(true)
+    expect(w.find('[data-test="fork"]').exists()).toBe(false)
+  })
+})
+
+// #698 分支菜单（#693 spec §1.5）：ChatHeader trailing 哑组件——仅 branches.length > 1 渲染；
+// 每项 = headline（空 →「未命名分支」）+「N 条消息」+ 时间（缺失槽位不渲染）；active 项打勾且
+// disabled（UI 从不发起 no-op switch）；branchBusy 时触发器禁用。
+describe('#698 ChatHeader 分支菜单', () => {
+  const BRANCHES = [
+    { leafEntryId: 'leaf-1', headline: '聊聊 A 方案', messageCount: 12, updatedAt: '2026-09-12T01:02:03Z', active: true },
+    { leafEntryId: 'leaf-2', headline: '', messageCount: 3, active: false }, // 空 headline + 无时间
+  ]
+  const mountHeader = (props: Record<string, unknown> = {}) =>
+    mount(ChatHeader, { props: { title: '会话', container: 'demo', connecting: false, ...props }, attachTo: document.body })
+
+  it('单分支 / 空列表 → 不渲染分支按钮（界面噪音门；0 = 拉取失败降级同路径）', () => {
+    expect(mountHeader().find('[data-test="branch-menu"]').exists()).toBe(false)
+    expect(mountHeader({ branches: [BRANCHES[0]] }).find('[data-test="branch-menu"]').exists()).toBe(false)
+    expect(mountHeader({ branches: [] }).find('[data-test="branch-menu"]').exists()).toBe(false)
+  })
+
+  it('多分支渲染：每项 = 摘要 + N 条消息 + 时间；空 headline →「未命名分支」；无 updatedAt → 时间槽位不渲染', async () => {
+    const w = mountHeader({ branches: BRANCHES })
+    await w.get('[data-test="branch-menu"]').trigger('click')
+    const items = w.findAll('[data-test^="branch-item"]') // 前缀选择：含 active 项（branch-item-active）
+    expect(items).toHaveLength(2)
+    expect(items[0].text()).toContain('聊聊 A 方案')
+    expect(items[0].text()).toContain('12 条消息')
+    expect(items[0].text()).toContain('2026') // toLocaleString 含年份
+    expect(items[1].text()).toContain('未命名分支') // 空 headline 回退文案
+    expect(items[1].text()).toContain('3 条消息')
+    expect(items[1].text()).not.toContain('2026') // 无 updatedAt：时间槽位不渲染
+    w.unmount()
+  })
+
+  it('messageCount 缺失 → 「N 条消息」槽位不渲染（item 保留）', async () => {
+    const w = mountHeader({ branches: [
+      { leafEntryId: 'leaf-1', headline: 'A', active: true },
+      { leafEntryId: 'leaf-2', headline: 'B', active: false },
+    ] })
+    await w.get('[data-test="branch-menu"]').trigger('click')
+    expect(w.text()).not.toContain('条消息')
+    w.unmount()
+  })
+
+  it('active 项打勾且不可选；非 active 项点击 emit branchSwitch(leafEntryId)', async () => {
+    const w = mountHeader({ branches: BRANCHES })
+    await w.get('[data-test="branch-menu"]').trigger('click')
+    const active = w.get('[data-test="branch-item-active"]')
+    expect(active.attributes('disabled')).toBeDefined() // 不可选（no-op switch 网关是 typed error，UI 从不发起）
+    expect(active.text()).toContain('✓')
+    await w.findAll('[data-test^="branch-item"]')[1].trigger('click')
+    expect(w.emitted('branchSwitch')).toEqual([['leaf-2']])
+    w.unmount()
+  })
+
+  it('branchBusy → 触发器禁用（不隐藏：顶栏布局稳定）；busy 翻转收起已开菜单', async () => {
+    const w = mountHeader({ branches: BRANCHES })
+    await w.get('[data-test="branch-menu"]').trigger('click')
+    expect(w.find('[data-test="branch-item"]').exists()).toBe(true)
+    await w.setProps({ branchBusy: true })
+    expect(w.get('[data-test="branch-menu"]').attributes('disabled')).toBeDefined()
+    expect(w.find('[data-test="branch-item"]').exists()).toBe(false) // 已开菜单强制收起
+    w.unmount()
   })
 })

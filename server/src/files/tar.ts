@@ -148,9 +148,9 @@ function paxRecord(key: string, value: string): Buffer {
   return Buffer.from(`${total} ${body}`, 'utf8')
 }
 
-// 造单个文件条目的 tar（putArchive 推进容器）。name 超 100 字节或含非 ASCII → 前置 PAX 'x' 头
-// （对齐 Go archive/tar：USTAR 只收纯 ASCII ≤100 字节，否则自动降级 PAX）。
-export function createTarFile(name: string, content: Buffer, mtimeSec = Math.floor(Date.now() / 1000)): Buffer {
+// 单条目块序列（PAX 长名头按需 + 条目头 + 数据 + padding，不含结束零块）——createTarFile/
+// createTarTree 共用。typeflag：'0' 文件 / '5' 目录（目录 size 恒 0、无数据段）。
+function entryBlocks(name: string, content: Buffer, typeflag: '0' | '5', mtimeSec: number): Buffer[] {
   const nameBytes = Buffer.from(name, 'utf8')
   const needsPax = nameBytes.length > 100 || nameBytes.some((b) => b >= 0x80)
   const chunks: Buffer[] = []
@@ -159,10 +159,37 @@ export function createTarFile(name: string, content: Buffer, mtimeSec = Math.flo
     chunks.push(headerOf('', pax.length, 'x', mtimeSec))
     chunks.push(pax, Buffer.alloc(alignTo(pax.length) - pax.length))
   }
-  chunks.push(headerOf(nameBytes.length <= 100 ? name : '', content.length, '0', mtimeSec))
-  chunks.push(content)
-  const pad = alignTo(content.length) - content.length
-  if (pad > 0) chunks.push(Buffer.alloc(pad))
+  chunks.push(headerOf(nameBytes.length <= 100 ? name : '', content.length, typeflag, mtimeSec))
+  if (content.length > 0) {
+    chunks.push(content)
+    const pad = alignTo(content.length) - content.length
+    if (pad > 0) chunks.push(Buffer.alloc(pad))
+  }
+  return chunks
+}
+
+// 造单个文件条目的 tar（putArchive 推进容器）。name 超 100 字节或含非 ASCII → 前置 PAX 'x' 头
+// （对齐 Go archive/tar：USTAR 只收纯 ASCII ≤100 字节，否则自动降级 PAX）。
+export function createTarFile(name: string, content: Buffer, mtimeSec = Math.floor(Date.now() / 1000)): Buffer {
+  return Buffer.concat([...entryBlocks(name, content, '0', mtimeSec), Buffer.alloc(BLOCK * 2)])
+}
+
+// 目录树条目（createTarTree 输入）：name 相对路径（'/' 分隔，无 './' 前缀）；file 必带 content。
+export interface TarTreeEntry {
+  name: string
+  type: 'file' | 'directory'
+  content?: Buffer
+  mtimeSec?: number
+}
+
+// 造多条目目录树 tar（putArchive 整树解包用，#6xx seedWorkspace）：目录先于其内容（先序），
+// 条目间无结束零块、末尾统一收尾——对齐 GNU tar 产出形态，daemon 解包时父目录先建。
+export function createTarTree(entries: TarTreeEntry[]): Buffer {
+  const chunks: Buffer[] = []
+  for (const e of entries) {
+    const content = e.type === 'file' ? (e.content ?? Buffer.alloc(0)) : Buffer.alloc(0)
+    chunks.push(...entryBlocks(e.name, content, e.type === 'file' ? '0' : '5', e.mtimeSec ?? Math.floor(Date.now() / 1000)))
+  }
   chunks.push(Buffer.alloc(BLOCK * 2)) // 结束零块
   return Buffer.concat(chunks)
 }
@@ -171,15 +198,17 @@ function headerOf(name: string, size: number, typeflag: string, mtime: number): 
   const h = Buffer.alloc(BLOCK)
   h.write(name.slice(0, 100), 0, 'utf8')
   h.write('0000644', 100, 'utf8') // mode 0644
-  h.write('0000000', 108, 'utf8') // uid 0
-  h.write('0000000', 116, 'utf8') // gid 0
+  // uid/gid = 容器内 node(1000:1000)：putArchive chown:true 是「应用头内 uid/gid」语义
+  // （bt 宿主实测非「跟随目标目录」），写 0 会落 root:root、agent 不可写（#660 回归）
+  h.write('0001750', 108, 'utf8') // uid 1000
+  h.write('0001750', 116, 'utf8') // gid 1000
   h.write(encodeOctal(size), 124, 'utf8')
   h.write(encodeOctal(mtime), 136, 'utf8')
   h.write(typeflag, 156, 'utf8')
   h.write('ustar', 257, 'utf8')
   h.write('00', 263, 'utf8')
-  h.write('root', 265, 'utf8')
-  h.write('root', 297, 'utf8')
+  h.write('node', 265, 'utf8')
+  h.write('node', 297, 'utf8')
   // chksum（148-155）：字段先置空格（tar 规范），求全头字节和，写 6 位八进制 + NUL + 空格
   h.fill(0x20, 148, 156)
   let sum = 0

@@ -30,6 +30,7 @@ class MemoryConfigArchive implements FileArchive {
   readonly configs = new Map<string, string>()
   // 故障注入：writeConfig 抛错（模拟 putArchive 失败——测真 writer 的 ConfigWriteError wrap）
   failWrite = false
+  async seedWorkspace(): Promise<void> {} // 本域不触达（编排 create 路径专用）
   async writeConfig(name: string, content: string): Promise<void> {
     if (this.failWrite) throw new Error('simulated putArchive failure')
     this.configs.set(name, content)

@@ -62,6 +62,32 @@ export interface ContainerInfo {
   readonly instanceName: string | null
 }
 
+// 一次性临时容器的 named volume 挂载（#696）：doctor 挂真容器三卷（同布局）；备份挂 home 卷 + 备份卷。
+// source 是卷名原文（不限于三卷——备份卷等各代资产另有命名）——调用方须经命名单一来源派生
+// （真容器三卷走 namedVolumesFor，防卷名规则四处手写漂移）；target 同理取容器内挂载点单一来源
+// （containers/constants 的 HOME_BIND / MOUNT_WIKI / MOUNT_WORKSPACE），不要手写路径字面量。
+export interface OneShotMount {
+  readonly source: string // named volume 名
+  readonly target: string // 容器内挂载点
+  readonly readOnly?: boolean // 只读挂载（如备份读源卷）
+}
+
+// 一次性临时容器语义参数（#696 runOnce）。与 ContainerSpec 的刻意差异：无实例名、无宿主端口、
+// 无 fleet 标签（故不进 fleet 列表与端口对账）；命令覆写镜像 ENTRYPOINT（见 buildOneShotOptions）。
+export interface OneShotSpec {
+  readonly image: string
+  readonly cmd: readonly string[]
+  readonly mounts?: readonly OneShotMount[]
+  // 追加/覆盖 env（与运行时基础 env 合并）。卷内 openclaw.json 的 ${...} 占位由进程运行时插值——
+  // 在卷上跑 CLI（如 openclaw doctor）须拿到同一份 env 才能正确读取配置。
+  readonly env?: Readonly<Record<string, string>>
+}
+
+// 一次性临时容器结果：容器 stdout+stderr 合并文本（诊断日志用，尽力而为——读不到日志时为 ''）。
+export interface OneShotResult {
+  readonly output: string
+}
+
 // 容器运行时接触面（docker daemon 原语）。DockerRuntime 与 FakeRuntime 结构满足本接口。
 export interface ContainerRuntime {
   // 创建并启动一个容器，返回 docker container id
@@ -91,4 +117,9 @@ export interface ContainerRuntime {
   execInContainer(name: string, cmd: string[]): Promise<void>
   // 同步等命令完成；退出码非 0 → 抛错（如 approve CLI）；NotFound 幂等
   execSync(name: string, cmd: string[]): Promise<void>
+  // 一次性临时容器（#696 升级编排前置）：以指定镜像 + 指定命令跑一个跑完即弃的容器——
+  // 创建（自定义命令、无 fleet 标签、无端口发布）→ 启动 → 等退出 → 强制删容器（卷一律不删，
+  // 备份卷等调用方资产须留存）。退出码非 0 → 抛 RunOnceError（携带 exitCode 与输出）；
+  // 成功/非 0/异常三路都清理容器。
+  runOnce(spec: OneShotSpec): Promise<OneShotResult>
 }

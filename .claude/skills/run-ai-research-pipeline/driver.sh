@@ -88,7 +88,10 @@ _ensure_fleet_image() {
   # 前端表现为「容器一直 creating」。docker daemon 不可达时跳过（driver 仍起前后端，仅容器创建不可用）。
   command -v docker >/dev/null 2>&1 || return 0
   docker info >/dev/null 2>&1 || { echo "[driver] 警告: docker daemon 不可达，容器创建将不可用"; return 0; }
-  local image="${OPENCLAW_IMAGE:-ghcr.io/acautomata/researcher-service/openclaw:latest}"   # 派生镜像（issue #588）；可覆盖回官方基线
+  # 默认 = 派生镜像**钉版本 tag**（与 Dockerfile FROM 基线单源，issue #695；本行是第四处运行期明文，
+  # 由 server/test/openclawImage.test.ts 交叉断言锁死）。按 deploy/README.md「派生镜像版本 tag 约定」
+  # 本地构建同 tag 镜像后此处直接命中，不会去拉私有 GHCR。
+  local image="${OPENCLAW_IMAGE:-ghcr.io/acautomata/researcher-service/openclaw:2026.9.4-browser}"   # 派生镜像（issue #588）；可覆盖回官方基线
   if ! docker image inspect "$image" >/dev/null 2>&1; then
     echo "[driver] 预拉 fleet 镜像 $image …"
     if docker pull "$image"; then

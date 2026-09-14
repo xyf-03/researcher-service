@@ -8,10 +8,51 @@
   多容器 fleet 由控制面经 Docker SDK 直接编排（不走本 compose），但镜像、env、挂载契约与此保持一致。
 - `.env.example` —— 网关环境变量模板（`GATEWAY_TOKEN` / `LLM_API_KEY` 等）。
 
-镜像默认 `ghcr.io/acautomata/researcher-service/openclaw:latest`（**自建派生镜像**，issue #588：`FROM`
-官方 `ghcr.io/openclaw/openclaw:2026.7.1-browser` 叠加 `pdftotext` 与 wiki/workspace 骨架，ADR 0011/0013；
-源在 `deploy/openclaw-image/`，经 `OPENCLAW_IMAGE` 可覆盖回官方基线），把 [ACautomata/researcher](https://github.com/ACautomata/researcher)
-仓库作为容器 `~/.openclaw` 配置卷挂载。researcher 仓库**不动**（其 workspace/、wiki/、skills/ 仍照常挂载）。
+镜像默认 `ghcr.io/acautomata/researcher-service/openclaw:2026.9.4-browser`（**自建派生镜像**，issue #588：`FROM`
+官方 `ghcr.io/openclaw/openclaw:2026.9.4-browser` 叠加 `pdftotext` 与 wiki/workspace 骨架，ADR 0011/0013；源在
+`deploy/openclaw-image/`，经 `OPENCLAW_IMAGE` 可覆盖回官方基线——**生产禁浮动 tag**，见下「派生镜像
+版本 tag 约定」），把 [ACautomata/researcher](https://github.com/ACautomata/researcher) 仓库作为容器
+`~/.openclaw` 配置卷挂载。researcher 仓库**不动**（其 workspace/、wiki/、skills/ 仍照常挂载）。
+
+## 派生镜像版本 tag 约定（issue #695）
+
+- **版本单源 = `deploy/openclaw-image/Dockerfile` 的 `FROM` 基线行**。四处**运行期**明文与之同版本，
+  由 `server/test/openclawImage.test.ts` 交叉断言锁死（防双源漂移）：控制面默认目标镜像
+  （`server/src/config.ts` 的 `OPENCLAW_IMAGE` 默认值）、模板栈 compose 默认值
+  （`deploy/docker-compose.yml`）、dev 管线 driver 预拉的默认镜像
+  （`.claude/skills/run-ai-research-pipeline/driver.sh`）、测试内的版本常量 `PINNED_TAG`；
+  CD 也从该行提取版本并推送派生镜像版本 tag。**文档里的版本属示意值**（不在锁内，换版时须一并同步：
+  本文档、根 `README.md` 环境表、`CONTEXT.md`、`docs/adr/` 里含版本正文的 0003（更新块 + 决定句）与
+  0013（派生镜像描述）、两份 `.env.example`）。测试夹具（`config.test.ts` / `tunnel*.test.ts` 的样本
+  引用、两个 smoke 的缺省常量）与其它**历史快照**（CD 注释里的版本形态示例、`docs/research/` 与代码 /
+  ADR 注释里带日期的一次性实测记录）不随 bump 改。
+- **版本 tag 一经发布不可移动**：`ghcr.io/acautomata/researcher-service/openclaw:<基线 tag>`
+  （当前 `2026.9.4-browser`）发布后内容冻结，**不得原地覆盖同名 tag**。容器升级编排的检测判定是
+  「容器记录镜像 ≠ 当前目标」，移动 tag 会让历史容器与目标的关系不可复现；回滚走 `:<CI head_sha>`。
+  bump 路径 = **基线换版**：改 Dockerfile `FROM` 行 → 版本 tag 自然前进，随之同步**四处**运行期明文
+  （config 默认值 / 模板栈 compose / dev driver / 测试常量 `PINNED_TAG`，四处均有静态断言兜底）。
+  **只换叠加层而基线不变**时，当前单源约定无 tag 可表达——不要覆盖旧 tag，须另立决策（把版本单源
+  改成独立常量，属后续演进）。
+- **CD 推三个 tag**：`:<基线 tag>`（钉版 = fleet 目标）+ `:latest` + `:<CI head_sha>`；版本号以
+  `grep` 从 Dockerfile `FROM` 行提取（单源，不引入第二配置源）。部署段显式重拉的就是版本 tag
+  （宿主 daemon 缓存与 fleet 目标同源）。
+- **生产禁浮动 tag**：`OPENCLAW_IMAGE` 为浮动引用（无 tag 或 `:latest`）→ server 启动 fail-fast
+  （机器强制，准据 `isFloatingImageRef`）。滚动 tag（`latest-browser` / `extended-stable-browser`）
+  同样禁用于生产、但**不由代码拦截**（上游命名无法穷举，靠 review 拦）——它们与本条要防的「目标
+  随上游移动」是同一风险。dev/test 不拦（本地调试可覆盖回官方 `:latest`）。
+- **本地开发手工打 tag**（CD 之外）：dev 栈 compose 不覆盖 `OPENCLAW_IMAGE`（走 config 默认值）、
+  模板栈 compose 的默认值同钉该版本 tag——故本地构建的镜像**必须**打成该版本 tag，否则会去私有
+  GHCR 拉取（无凭证即失败）。
+
+  ```bash
+  # 版本 tag 单源 = Dockerfile FROM 行（与 CD 同一提取方式；CD 另对 digest 行与「末段是 registry
+  # 端口」的形态显式拒绝）
+  TAG="$(grep -m1 -E '^[[:space:]]*FROM[[:space:]]' deploy/openclaw-image/Dockerfile | awk '{print $2}')"; TAG="${TAG##*:}"
+  docker build -t "ghcr.io/acautomata/researcher-service/openclaw:${TAG}" deploy/openclaw-image
+  # 已构建过镜像时补打（等价；源为先前构建的任意 tag，此处以 :latest 为例）：
+  # docker tag ghcr.io/acautomata/researcher-service/openclaw:latest \
+  #   "ghcr.io/acautomata/researcher-service/openclaw:${TAG}"
+  ```
 
 ## 在新架构中的位置
 
@@ -23,6 +64,9 @@ Express 控制面 (server/src/containers)
     │ 3. named volume 拓扑（ADR 0011，#590/#592）：openclaw-wiki/workspace/home-<id> 三卷，
     │    空卷首挂由镜像内 ~/.openclaw 骨架自动初始化；home 模板（researcher 克隆）生产经
     │    server 镜像构建期入镜像（ADR 0013，#593），不再挂载宿主
+    │ 4. 模板 workspace 灌卷（#6xx）：createComplete 在 create 后 start 前，把镜像内模板的
+    │    workspace/ 树（researcher 各项 md + skills）经 putArchive(chown) 灌进容器
+    │    ~/.openclaw/workspace（骨架占位被 researcher 内容覆盖；旧 bind 模式 provision 已预填充，不重复灌）
     ▼
 OpenClaw 容器 fleet（容器内统一 18789，宿主端口池 19000–19999 取最小空闲）
 ```
@@ -145,7 +189,8 @@ volume（卷物理路径在 Docker VM 内）→ dev/prod 寻址/路径分叉」�
 git clone --depth 1 https://github.com/ACautomata/researcher ./researcher
 
 # 2.（仅真编排需）备派生镜像 + LLM key；仅起控制面/登录可跳过
-docker build -t ghcr.io/acautomata/researcher-service/openclaw:latest deploy/openclaw-image
+#    镜像 tag 须 = Dockerfile FROM 基线版本 tag（config 默认目标镜像钉的就是它，issue #695）——
+#    构建命令见上「派生镜像版本 tag 约定」（该命令只在那里维护一处，不在此重复拷贝）
 export LLM_API_KEY=...
 
 # 3. 起 dev 控制面（server:8001，挂 docker.sock + panel-dev-db 卷）

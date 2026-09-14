@@ -36,6 +36,11 @@ const { MockGatewayChat } = vi.hoisted(() => {
     deleteSession = vi.fn()
     getHistory = vi.fn()
     send = vi.fn()
+    rewind = vi.fn() // #694 对话回退（sessions.rewind）
+    forkEntry = vi.fn() // #697 对话 fork（sessions.fork）
+    listBranches = vi.fn() // #698 分支菜单（sessions.branches.list）
+    switchBranch = vi.fn() // #698 分支切换（sessions.branches.switch）
+    sessionControlAvailable = vi.fn(() => true) // #694 会话控制能力（默认 9.4+ 网关可用）
     listCommands = vi.fn()
     resolveApproval = vi.fn()
     listPendingApprovals = vi.fn() // B0: 审批补拉（切页/断线恢复）
@@ -115,6 +120,7 @@ async function mountReady() {
   gw.createSession.mockResolvedValue('sk-new')
   gw.listCommands.mockResolvedValue([])
   gw.send.mockResolvedValue(undefined)
+  gw.switchBranch.mockResolvedValue(undefined) // #698：缺省分支切换成功（各用例按需改写）
   gw.deleteSession.mockResolvedValue(undefined)
   gw.resolveApproval.mockResolvedValue(undefined)
   gw.listPendingApprovals.mockResolvedValue([]) // B0: 缺省无待补拉审批
@@ -766,7 +772,8 @@ describe('ChatView', () => {
 
   // #565: 结构化 thinking 块（新版网关 message.content[] 的 type==='thinking' 块）——流式路最小覆盖：
   // 结构化块只在 replace 快照/final 的 content[] 出现，翻译层提取随 text 帧携带（thinking 字段），
-  // handleText 以 ?? 覆盖内联剥离结果。思考卡渲染（Msg.thinking 非空即渲染，折叠卡逻辑未改）。
+  // handleText 以 ?? 覆盖内联剥离结果。思考卡流式渲染；#664 起完成轮自动折叠——done 后展开
+  // 折叠条仍见思考卡（done 收尾不冲掉结构化思考：terminal 重解析只作用于内联路）。
   it('#565: 流式 replace 快照含结构化 thinking 块 → 思考卡渲染（结构化块权威覆盖）', async () => {
     const { w, gw } = await mountReady()
     await w.find('[data-test="input"]').setValue('hi')
@@ -776,11 +783,15 @@ describe('ChatView', () => {
     expect(w.find('[data-test="cot-card"]').exists()).toBe(true)
     expect(w.find('[data-test="cot-card"]').text()).toContain('推理过程')
     expect(w.find('[data-test="stream"]').text()).toContain('回答')
-    // done 收尾不冲掉结构化思考（finalizeLast 的 terminal 重解析只作用于内联路）
+    // done 收尾不冲掉结构化思考：自动折叠（#664）后展开折叠条，思考卡仍在
     gw.fireFrame({ type: 'done', runId: 'r1' })
     await nextTick()
-    expect(w.find('[data-test="cot-card"]').exists()).toBe(true)
+    expect(w.find('[data-test="cot-card"]').exists()).toBe(false) // 已收进折叠条
+    await w.find('[data-test="trace-fold"]').trigger('click') // 手动展开
     expect(w.find('[data-test="cot-card"]').text()).toContain('推理过程')
+    await w.find('[data-test="trace-fold"]').trigger('click') // 再点收起（单层开合可逆）
+    expect(w.find('[data-test="cot-card"]').exists()).toBe(false) // 轨迹收回
+    expect(w.find('[data-test="trace-fold"]').exists()).toBe(true) // 条面仍在
   })
 
   // #565: 结构化思考跨帧存活——replace 快照帧带思考后，普通 delta 增量帧（无 thinking 字段，
@@ -798,7 +809,8 @@ describe('ChatView', () => {
   })
 
   // #565: 思考只在 final 的 content[] 出现（流式 deltaText 无思考信息）→ final 文本与已发相等，
-  // 翻译层经 done 帧独立通道携带思考（不经 handleText 的 raw 逻辑），思考卡终态渲染
+  // 翻译层经 done 帧独立通道携带思考（不经 handleText 的 raw 逻辑）；#664 起完成轮自动折叠——
+  // 展开折叠条仍见思考卡（思考数据终态存活）。
   it('#565: 流式文本发完后 final 才带思考（相等场景）→ done 帧思考卡渲染', async () => {
     const { w, gw } = await mountReady()
     await w.find('[data-test="input"]').setValue('hi')
@@ -806,7 +818,8 @@ describe('ChatView', () => {
     gw.fireFrame({ type: 'text', runId: 'r1', delta: '回答' }) // deltaText 流式（无思考信息）
     gw.fireFrame({ type: 'done', runId: 'r1', thinking: '最终思考' }) // final 相等 → done 帧带思考
     await nextTick()
-    expect(w.find('[data-test="cot-card"]').exists()).toBe(true)
+    expect(w.find('[data-test="trace-fold"]').exists()).toBe(true) // done 自动折叠（#664）
+    await w.find('[data-test="trace-fold"]').trigger('click')
     expect(w.find('[data-test="cot-card"]').text()).toContain('最终思考')
     expect(w.find('[data-test="stream"]').text()).toContain('回答')
   })
@@ -819,6 +832,8 @@ describe('ChatView', () => {
     gw.fireFrame({ type: 'text', runId: 'r1', delta: '<thinking>内心</thinking>回答' })
     gw.fireFrame({ type: 'done', runId: 'r1' })
     await nextTick()
+    expect(w.find('[data-test="trace-fold"]').exists()).toBe(true) // done 自动折叠（#664）
+    await w.find('[data-test="trace-fold"]').trigger('click')
     expect(w.find('[data-test="cot-card"]').text()).toContain('内心')
     expect(w.find('[data-test="stream"]').text()).toContain('回答')
   })
@@ -845,23 +860,26 @@ describe('ChatView', () => {
     expect(w.find('[data-test="stream"]').text()).toContain('历史回答')
   })
 
-  it('历史分页：hasMore 时 load-more 用 nextOffset 锚点拉更旧页', async () => {
+  it('历史分页：loadHistory 拉全后按钮不再出现；中途失败降级留 hasMore，load-more 用锚点续拉', async () => {
     const w = mount(ChatView)
     await flushPromises()
     const gw = MockGatewayChat.last!
     gw.listSessions.mockResolvedValue([SESSION])
     gw.listCommands.mockResolvedValue([])
     gw.send.mockResolvedValue(undefined)
-    // 首次 loadHistory 返回 hasMore:true（触发「加载更多」按钮）；load-more 拉更旧页
+    // issue #535：loadHistory 现自动循环拉全——手动「加载更多」的可达入口只剩中途失败降级
+    //（catch 保留已拉页 + hasMore=true）。mock：首页成功 → 第二页失败 → 续拉恢复。
     gw.getHistory
       .mockResolvedValueOnce({ messages: [{ role: 'user', text: '旧页' }], hasMore: true, nextOffset: 10 })
+      .mockRejectedValueOnce(new Error('网关抖动'))
       .mockResolvedValueOnce({ messages: [{ role: 'user', text: '更旧页' }], hasMore: false, nextOffset: null })
     gw.fireReady()
-    await flushPromises() // selectContainer 续 listSessions + loadHistory(hasMore:true)
-    expect(w.find('[data-test="load-more"]').exists()).toBe(true)
+    await flushPromises() // loadHistory：首页成功 + 第二页失败 → 降级铺底
+    expect(w.find('[data-test="stream"]').text()).toContain('旧页') // 已拉到的页不空白
+    expect(w.find('[data-test="load-more"]').exists()).toBe(true) // 降级留 hasMore → 按钮可续拉
     await w.find('[data-test="load-more"]').trigger('click')
     await flushPromises()
-    expect(gw.getHistory).toHaveBeenLastCalledWith('sk-1', undefined, '10')
+    expect(gw.getHistory).toHaveBeenLastCalledWith('sk-1', undefined, 10) // Codex #678 P1：锚点保留 number 类型（offset），不再 String 化
     expect(w.find('[data-test="stream"]').text()).toContain('更旧页')
   })
 
@@ -1450,6 +1468,8 @@ describe('ChatView', () => {
 
   // #565: 历史路全量覆盖——网关 history 下发完整消息，content[] 的 type==='thinking' 结构化块
   //（thinking 字段）经 extractThinking 提取填 Msg.thinking → 思考折叠卡渲染（thinking 不进正文）。
+  // #666 T3：有轨迹的历史消息默认折叠——思考卡收进折叠条（条面步骤计数无「已执行」），
+  // 展开折叠条后思考卡仍在（提取数据不丢）。
   it('#565: 历史 assistant 消息含结构化 thinking 块（thinking 字段）→ 思考卡渲染', async () => {
     const w = mount(ChatView)
     await flushPromises()
@@ -1470,10 +1490,14 @@ describe('ChatView', () => {
     gw.send.mockResolvedValue(undefined)
     gw.fireReady()
     await flushPromises()
-    // 思考只出现在折叠卡（data-test="cot-card"），正文（stream）为提取出的 text 内容
+    // T3（#666）：有轨迹历史轮默认折叠——条面计数「执行过程 · 思考」（无时长），正文恒在折叠外
+    expect(w.get('[data-test="trace-fold-label"]').text()).toBe('执行过程 · 思考')
+    expect(w.find('[data-test="cot-card"]').exists()).toBe(false) // 思考卡默认收进折叠条
+    expect(w.find('[data-test="stream"]').text()).toContain('历史回答')
+    // 展开折叠条：思考只出现在折叠卡（data-test="cot-card"），正文（stream）为提取出的 text 内容
+    await w.find('[data-test="trace-fold"]').trigger('click')
     expect(w.find('[data-test="cot-card"]').exists()).toBe(true)
     expect(w.find('[data-test="cot-card"]').text()).toContain('历史推理')
-    expect(w.find('[data-test="stream"]').text()).toContain('历史回答')
   })
 
   // #565 回归：历史消息无结构化 thinking 块（仅 text 字段的旧 shape）→ 思考卡不出现（thinking ''，
@@ -1505,6 +1529,8 @@ describe('ChatView', () => {
   // E1b: abort 固化的 toolCall-only assistant 消息（生产实测：exec 审批卡无人处理 → 网关
   // stuck-session recovery abort run → 最后一条 assistant content=[thinking,toolCall×3] 无 text
   // 块）→ 不得渲染空白气泡（user 消息下出现空 assistant 气泡，用户误以为回复丢失）。
+  // #666 T3：有轨迹历史轮默认折叠——气泡渲染折叠条（非空白），展开后工具行（done 态）逐行可见。
+  //（thinking 块用 text 字段、非官方 thinking 字段 → 不提取（#565 回归语义），计数无「思考」段）
   it('E1b: 历史 toolCall-only assistant 消息（abort 固化）→ 不渲染空白气泡', async () => {
     const w = mount(ChatView)
     await flushPromises()
@@ -1532,12 +1558,16 @@ describe('ChatView', () => {
     await flushPromises()
     const streamText = w.find('[data-test="stream"]').text()
     expect(streamText).toContain('录入一下这篇论文') // user 消息正常渲染
-    // 不得渲染空白气泡：toolCall-only 消息渲染为工具行（done 态）而非空 assistant 气泡
+    // 不得渲染空白气泡：toolCall-only 消息渲染折叠条（T3 默认折叠），条面步骤计数可见
     const bubbles = w.findAll('.msg.assistant')
     expect(bubbles.length).toBe(1) // 只有一个 assistant 消息（该 toolCall-only 消息）
     expect(bubbles[0].text().trim()).not.toBe('') // 不得是空白气泡
-    expect(bubbles[0].find('[data-test="tool-line"]').exists()).toBe(true) // 渲染为工具行
-    expect(bubbles[0].text()).toContain('wiki_search') // 工具名可见（agent 实际调过什么）
+    expect(bubbles[0].get('[data-test="trace-fold-label"]').text()).toBe('执行过程 · 3 次工具')
+    expect(bubbles[0].find('[data-test="tool-line"]').exists()).toBe(false) // 工具行默认收进折叠条
+    // 展开折叠条：渲染为工具行（done 态），工具名可见（agent 实际调过什么）
+    await bubbles[0].find('[data-test="trace-fold"]').trigger('click')
+    expect(bubbles[0].findAll('[data-test="tool-line"]')).toHaveLength(3)
+    expect(bubbles[0].text()).toContain('wiki_search')
   })
 
   it('E2: 断线时新建会话被守卫（不裸错误、不清 transcript）', async () => {
@@ -2289,4 +2319,350 @@ describe('ChatView', () => {
       expect(outbox.takePending('other', 'sk-1')).toHaveLength(1) // other 容器的残留不动
     })
   })
+
+  // ---- 消息锚点导航（issue #669）view 接线断言（行为覆盖在 chatComponents/anchorNav 测试）----
+  it('#669: 锚点轨接线——user 消息入流后 stream 内出现刻度，切会话重置消失', async () => {
+    const { w, gw } = await mountReady()
+    expect(w.find('[data-test="stream"] [data-test="anchor-rail"]').exists()).toBe(false)
+    // jsdom 无布局（scrollHeight=clientHeight=0 → 轨隐藏）：stub 滚动几何放行轨渲染
+    const streamEl = w.get('[data-test="stream"]').element as HTMLElement
+    Object.defineProperty(streamEl, 'scrollHeight', { configurable: true, value: 1000 })
+    Object.defineProperty(streamEl, 'clientHeight', { configurable: true, value: 100 })
+    await w.find('[data-test="input"]').setValue('第一条输入')
+    await w.find('[data-test="send"]').trigger('click')
+    gw.fireFrame({ type: 'text', runId: 'r1', delta: '回答' })
+    gw.fireFrame({ type: 'done', runId: 'r1' })
+    await nextTick()
+    // 轨挂在 stream 内，刻度按消息下标锚定（user 消息 = 下标 0）
+    expect(w.find('[data-test="stream"] [data-test="anchor-dot-0"]').exists()).toBe(true)
+    // 切新会话 → messages 清空 → 轨重置消失
+    gw.createSession.mockResolvedValueOnce('sk-2')
+    await w.find('[data-test="new-session"]').trigger('click')
+    await flushPromises()
+    expect(w.find('[data-test="stream"] [data-test="anchor-rail"]').exists()).toBe(false)
+  })
+
+  // ---- #694 对话回退端到端（view 接线：入口渲染门 / 草稿指纹 / 回填 composer + 预览条）----
+  describe('#694 对话回退接线', () => {
+    const HISTORY_WITH_ENTRY = [
+      { role: 'user', text: '第一问', __openclaw: { id: 'entry-1' } },
+      { role: 'assistant', text: '第一答', __openclaw: { id: 'entry-2' } },
+    ]
+
+    // 首连即带一条已持久化 user 消息（有 entryId）的会话历史。
+    async function mountWithHistory() {
+      const w = mount(ChatView)
+      await flushPromises()
+      const gw = MockGatewayChat.last!
+      gw.listSessions.mockResolvedValue([SESSION])
+      gw.getHistory.mockResolvedValue({ messages: HISTORY_WITH_ENTRY, hasMore: false, nextOffset: null })
+      gw.listCommands.mockResolvedValue([])
+      gw.listPendingApprovals.mockResolvedValue([])
+      gw.send.mockResolvedValue(undefined) // 「agent 工作中」用例要真的发一条（未 stub 会 unhandled rejection）
+      gw.fireReady()
+      await flushPromises()
+      return { w, gw }
+    }
+
+    it('入口渲染门：网关支持会话控制时渲染；不支持（存量旧镜像）时整体隐藏', async () => {
+      const { w, gw } = await mountWithHistory()
+      expect(w.find('[data-test="rewind"]').exists()).toBe(true)
+      // 重连到不支持会话控制的旧网关（capability 撤销）→ 入口消失（不出现必然报错的按钮）
+      gw.sessionControlAvailable.mockReturnValue(false)
+      gw.fireReady()
+      await flushPromises()
+      expect(w.find('[data-test="rewind"]').exists()).toBe(false)
+    })
+
+    it('agent 工作中（流式）→ 入口隐藏', async () => {
+      const { w } = await mountWithHistory()
+      await w.find('[data-test="input"]').setValue('新问题')
+      await w.find('[data-test="send"]').trigger('click')
+      await nextTick()
+      expect(w.find('[data-test="rewind"]').exists()).toBe(false) // 占位已入流 → streaming
+    })
+
+    it('确认回退 → sessions.rewind + transcript 重建 + 被剪文本与图片附件回填 composer', async () => {
+      const { w, gw } = await mountWithHistory()
+      gw.rewind.mockResolvedValue({
+        editorText: '第一问',
+        editorAttachments: [{ mimeType: 'image/png', data: 'AAAA' }],
+      })
+      // 回退后全量重拉 = 新活跃路径（该消息之前为空）
+      gw.getHistory.mockResolvedValue({ messages: [], hasMore: false, nextOffset: null })
+
+      await w.find('[data-test="rewind"]').trigger('click')
+      await w.find('[data-test="rewind-confirm-yes"]').trigger('click')
+      await flushPromises()
+
+      expect(gw.rewind).toHaveBeenCalledWith('sk-1', 'entry-1')
+      expect(w.find('[data-test="stream"]').text()).not.toContain('第一问') // 被剪历史消失
+      expect((w.find('[data-test="input"]').element as HTMLTextAreaElement).value).toBe('第一问') // 文本回填
+      expect(w.find('[data-test="preview-strip"]').exists()).toBe(true) // 图片附件一并回填
+      expect(w.findAll('[data-test="preview-item"]').length).toBe(1)
+    })
+
+    it('回退等待期间改动草稿 → 跳过回填（新草稿原地保留），transcript 回退照常完成', async () => {
+      const { w, gw } = await mountWithHistory()
+      const deferred: { resolve?: (v: { editorText: string; editorAttachments: never[] }) => void } = {}
+      gw.rewind.mockImplementation(() => new Promise((r) => { deferred.resolve = r }))
+      gw.getHistory.mockResolvedValue({ messages: [], hasMore: false, nextOffset: null })
+
+      await w.find('[data-test="rewind"]').trigger('click')
+      await w.find('[data-test="rewind-confirm-yes"]').trigger('click')
+      await flushPromises()
+      // RPC 在途期间用户继续打字（草稿指纹改变）
+      await w.find('[data-test="input"]').setValue('我改主意了')
+      deferred.resolve?.({ editorText: '第一问', editorAttachments: [] })
+      await flushPromises()
+
+      expect((w.find('[data-test="input"]').element as HTMLTextAreaElement).value).toBe('我改主意了')
+      expect(w.find('[data-test="stream"]').text()).not.toContain('第一问') // transcript 照常回退
+    })
+
+    it('回退失败 → 瞬时错误提示（动作类通道），transcript 不动', async () => {
+      const { w, gw } = await mountWithHistory()
+      gw.rewind.mockRejectedValue(new Error('Rewind is unavailable while the agent is working.'))
+
+      await w.find('[data-test="rewind"]').trigger('click')
+      await w.find('[data-test="rewind-confirm-yes"]').trigger('click')
+      await flushPromises()
+
+      // 动作类失败走 toast（贴 #461 删除会话失败先例）；不进顶部连接横幅——横幅 label 恒「加载失败」，
+      // 把「回退失败：…」套在其下语义相左（Spec 轴 review）。
+      expect(ElMessage.error).toHaveBeenCalledWith('回退失败：Rewind is unavailable while the agent is working.')
+      expect(w.find('[data-test="error-bar"]').exists()).toBe(false)
+      expect(w.find('[data-test="stream"]').text()).toContain('第一问') // 原历史原样
+    })
+
+    it('断线重连后会话/历史同步完成前，旧投影上的回退入口继续隐藏（Codex #703 review P1）', async () => {
+      const { w, gw } = await mountWithHistory()
+      expect(w.find('[data-test="rewind"]').exists()).toBe(true) // 首连后投影权威，入口渲染
+
+      // 断线：入口被 disconnected 门挡住；投影保留（重连前用户看到的仍是断线前的旧条目）
+      gw.fireClose(1006, '', true)
+      await flushPromises()
+      expect(w.find('[data-test="rewind"]').exists()).toBe(false)
+
+      // 重连握手完成，但 listSessions 迟迟不回（慢网关）——此刻投影是断线前的旧条目，
+      // 期间网关真实转录可能已前进；若入口恢复可点，用户可能剪除自己还没看到的更新轮次。
+      // 用 holder 对象而非裸 let 变量：TS 5.4+ 闭包赋值对闭包外引用点不可见（CFA 保留窄化），
+      // `let listing = null` + 闭包内赋值会让 `listing?.()` 被判 never（TS2349）；属性访问不受此限。
+      const listing: { resolve?: (v: Array<typeof SESSION>) => void } = {}
+      gw.listSessions.mockImplementation(() => new Promise((resolve) => { listing.resolve = resolve }))
+      gw.fireReady()
+      await flushPromises()
+      expect(w.find('[data-test="rewind"]').exists()).toBe(false) // ← 修复前：此处入口已恢复（bug）
+
+      // 同步落地 → 投影权威 → 入口恢复
+      listing.resolve?.([SESSION])
+      await flushPromises()
+      expect(w.find('[data-test="rewind"]').exists()).toBe(true)
+    })
+  })
+
+  // ---- #697 对话 fork 端到端（view 接线：入口 / 导航 / 播种 / 源会话保留 / 失败不变更）----
+  describe('#697 对话 fork 接线', () => {
+    const HISTORY_WITH_ENTRY = [
+      { role: 'user', text: '第一问', __openclaw: { id: 'entry-1' } },
+      { role: 'assistant', text: '第一答', __openclaw: { id: 'entry-2' } },
+      { role: 'user', text: '第二问', __openclaw: { id: 'entry-3' } },
+    ]
+
+    async function mountWithHistory() {
+      const w = mount(ChatView)
+      await flushPromises()
+      const gw = MockGatewayChat.last!
+      gw.listSessions.mockResolvedValue([SESSION])
+      gw.getHistory.mockResolvedValue({ messages: HISTORY_WITH_ENTRY, hasMore: false, nextOffset: null })
+      gw.listCommands.mockResolvedValue([])
+      gw.listPendingApprovals.mockResolvedValue([])
+      gw.fireReady()
+      await flushPromises()
+      return { w, gw }
+    }
+
+    it('AC1/AC2：点「从此分叉」免确认 → sessions.fork + 列表顶部新会话 + 原地切换 + 新 transcript 前缀 + composer 播种', async () => {
+      const { w, gw } = await mountWithHistory()
+      // fork 切点 = 第二问（entry-3）之前：新会话 transcript = 第一问答；第二问播种 composer
+      gw.getHistory.mockResolvedValue({ messages: HISTORY_WITH_ENTRY.slice(0, 2), hasMore: false, nextOffset: null })
+      gw.forkEntry.mockResolvedValue({
+        sessionKey: 'sk-fork-1',
+        editorText: '第二问',
+        editorAttachments: [{ mimeType: 'image/png', data: 'AAAA' }],
+      })
+      gw.listSessions.mockResolvedValue([
+        { session_key: 'sk-fork-1', title: '', updated_at: '' },
+        SESSION,
+      ])
+
+      await w.findAll('[data-test="fork"]')[1].trigger('click') // 免确认：一步直达（第二问的入口）
+      await flushPromises()
+
+      expect(gw.forkEntry).toHaveBeenCalledWith('sk-1', 'entry-3')
+      expect(w.find('[data-test="session-sk-fork-1"]').exists()).toBe(true) // 列表出现新会话
+      expect(w.find('[data-test="stream"]').text()).toContain('第一问') // 新 transcript = 切点前缀
+      expect(w.find('[data-test="stream"]').text()).not.toContain('第二问') // 被点消息不在新会话里（去播种了）
+      expect((w.find('[data-test="input"]').element as HTMLTextAreaElement).value).toBe('第二问') // 播种
+      expect(w.findAll('[data-test="preview-item"]').length).toBe(1) // 图片附件一并播种
+    })
+
+    it('AC3：切回源会话 → transcript 完整、源草稿保留', async () => {
+      const { w, gw } = await mountWithHistory()
+      await w.find('[data-test="input"]').setValue('源会话草稿') // 切走前留下的草稿
+      gw.getHistory.mockImplementation((key: unknown) =>
+        Promise.resolve(
+          key === 'sk-fork-1'
+            ? { messages: HISTORY_WITH_ENTRY.slice(0, 2), hasMore: false, nextOffset: null }
+            : { messages: HISTORY_WITH_ENTRY, hasMore: false, nextOffset: null },
+        ),
+      )
+      gw.forkEntry.mockResolvedValue({ sessionKey: 'sk-fork-1', editorText: '第二问', editorAttachments: [] })
+      gw.listSessions.mockResolvedValue([
+        { session_key: 'sk-fork-1', title: '', updated_at: '' },
+        SESSION,
+      ])
+
+      await w.find('[data-test="fork"]').trigger('click')
+      await flushPromises()
+      // 切回源会话（fork 排在列表 sk-fork-1 之后）
+      await w.find('[data-test="session-sk-1"]').trigger('click')
+      await flushPromises()
+
+      expect(w.find('[data-test="stream"]').text()).toContain('第二问') // 源 transcript 完整（含被点消息）
+      expect((w.find('[data-test="input"]').element as HTMLTextAreaElement).value).toBe('源会话草稿') // 源草稿按 draftKey 存回/恢复
+    })
+
+    it('AC3（续）：fork 成功切回源会话后仍可正常发送消息（源会话后续发送不受影响）', async () => {
+      const { w, gw } = await mountWithHistory()
+      gw.getHistory.mockImplementation((key: unknown) =>
+        Promise.resolve(
+          key === 'sk-fork-1'
+            ? { messages: HISTORY_WITH_ENTRY.slice(0, 2), hasMore: false, nextOffset: null }
+            : { messages: HISTORY_WITH_ENTRY, hasMore: false, nextOffset: null },
+        ),
+      )
+      gw.forkEntry.mockResolvedValue({ sessionKey: 'sk-fork-1', editorText: '第二问', editorAttachments: [] })
+      gw.listSessions.mockResolvedValue([
+        { session_key: 'sk-fork-1', title: '', updated_at: '' },
+        SESSION,
+      ])
+      gw.send.mockResolvedValue('run-after-fork') // 源会话继续发送成功路径
+
+      await w.find('[data-test="fork"]').trigger('click')
+      await flushPromises()
+      await w.find('[data-test="session-sk-1"]').trigger('click')
+      await flushPromises()
+
+      await w.find('[data-test="input"]').setValue('源会话的后续问题')
+      await w.find('[data-test="send"]').trigger('click')
+      await flushPromises()
+
+      // 发到了源会话（不是 fork 出的新会话），乐观 echo 已入流（无附件 → attachments 为 undefined）
+      expect(gw.send.mock.calls[0]?.[0]).toBe('sk-1')
+      expect(gw.send.mock.calls[0]?.[1]).toBe('源会话的后续问题')
+      expect(w.find('[data-test="stream"]').text()).toContain('源会话的后续问题')
+    })
+
+    it('AC4：fork 失败 → 瞬时错误提示（动作类通道），视图/列表/输入框全部原样', async () => {
+      const { w, gw } = await mountWithHistory()
+      await w.find('[data-test="input"]').setValue('我的草稿')
+      gw.forkEntry.mockRejectedValue(new Error('Fork is unavailable while the agent is working.'))
+
+      await w.find('[data-test="fork"]').trigger('click')
+      await flushPromises()
+
+      expect(ElMessage.error).toHaveBeenCalledWith('分叉失败：Fork is unavailable while the agent is working.')
+      expect(w.find('[data-test="error-bar"]').exists()).toBe(false) // 不进连接横幅
+      expect(w.find('[data-test="stream"]').text()).toContain('第二问') // 源 transcript 原样
+      expect(w.find('[data-test="session-sk-fork-1"]').exists()).toBe(false) // 无占位行
+      expect((w.find('[data-test="input"]').element as HTMLTextAreaElement).value).toBe('我的草稿') // 草稿不动
+    })
+
+    it('AC5：fork 在途 → 发送键置灰 + 入口隐藏；落地后恢复', async () => {
+      const { w, gw } = await mountWithHistory()
+      const deferred: { resolve?: (v: { sessionKey: string; editorText: string; editorAttachments: never[] }) => void } = {}
+      gw.forkEntry.mockImplementation(() => new Promise((r) => { deferred.resolve = r }))
+      gw.getHistory.mockResolvedValue({ messages: [], hasMore: false, nextOffset: null })
+      gw.listSessions.mockResolvedValue([{ session_key: 'sk-fork-1', title: '', updated_at: '' }, SESSION])
+
+      await w.find('[data-test="fork"]').trigger('click')
+      await flushPromises()
+      expect(w.find('[data-test="fork"]').exists()).toBe(false) // 窗口内入口隐藏
+      expect((w.find('[data-test="send"]').element as HTMLButtonElement).disabled).toBe(true) // 发送键置灰
+
+      deferred.resolve?.({ sessionKey: 'sk-fork-1', editorText: '', editorAttachments: [] })
+      await flushPromises()
+      expect((w.find('[data-test="send"]').element as HTMLButtonElement).disabled).toBe(false) // 落地恢复
+    })
+  })
+
+// #698 分支菜单接线（#693 spec §1.4/§1.5）：分支数据随首连/切会话并行预拉；多分支才渲染按钮；
+// 切换 → switchBranch + transcript 重建 + 分支列表重拉；失败 → 瞬时错误提示且本地状态不动。
+// 「仅 >1 分支渲染」的 length 门已在 chatComponents.test.ts 哑组件层单点覆盖，此处只测接线联动。
+describe('ChatView #698 分支菜单接线', () => {
+  const BRANCHES = [
+    { leafEntryId: 'leaf-1', headline: 'A 方向', messageCount: 4, updatedAt: '2026-09-12T01:02:03Z', active: true },
+    { leafEntryId: 'leaf-2', headline: 'B 方向', messageCount: 2, updatedAt: '2026-09-11T00:00:00Z', active: false },
+  ]
+
+  it('多分支 → 头部渲染分支按钮；单分支/能力撤销 → 不渲染', async () => {
+    const { w, gw } = await mountReady()
+    gw.listBranches.mockResolvedValue(BRANCHES)
+    gw.fireReady() // 重连触发 syncSessions 再预拉
+    await flushPromises()
+    gw.listBranches.mockClear() // mountReady 首连 + 本次重连各预拉一次，清零后从零计数
+    expect(w.find('[data-test="branch-menu"]').exists()).toBe(true)
+
+    // 单分支（回退剪除后 / 网关只剩一条）→ 按钮消失
+    gw.listBranches.mockResolvedValue([BRANCHES[0]])
+    gw.fireReady() // 重连再同步：预拉到单分支
+    await flushPromises()
+    expect(w.find('[data-test="branch-menu"]').exists()).toBe(false)
+  })
+
+  it('切换分支 → sessions.branches.switch + transcript 重建 + 分支列表重拉为新状态', async () => {
+    const { w, gw } = await mountReady()
+    gw.listBranches.mockResolvedValue(BRANCHES)
+    gw.fireReady()
+    await flushPromises()
+    gw.listBranches.mockClear() // mountReady 首连 + 本次重连各预拉一次，清零后从零计数
+
+    // 切换后：新活跃路径历史 + leaf-2 成为 active
+    gw.getHistory.mockResolvedValue({
+      messages: [{ role: 'user', text: 'B 方向第一问', __openclaw: { id: 'entry-b1' } }],
+      hasMore: false, nextOffset: null,
+    })
+    gw.listBranches.mockResolvedValue([
+      { leafEntryId: 'leaf-1', headline: 'A 方向', messageCount: 4, active: false },
+      { leafEntryId: 'leaf-2', headline: 'B 方向', messageCount: 3, active: true },
+    ])
+
+    await w.find('[data-test="branch-menu"]').trigger('click')
+    await w.findAll('[data-test^="branch-item"]')[1].trigger('click')
+    await flushPromises()
+
+    expect(gw.switchBranch).toHaveBeenCalledWith('sk-1', 'leaf-2')
+    expect(w.find('[data-test="stream"]').text()).toContain('B 方向第一问') // transcript 重建为新活跃路径
+    expect(gw.listBranches).toHaveBeenCalledTimes(1) // 分支列表重拉（清零后仅切换这一次）
+    expect(w.find('[data-test="branch-menu"]').exists()).toBe(true) // 重拉后仍多分支 → 按钮还在
+  })
+
+  it('切换失败 → 瞬时错误提示（动作类通道），transcript 与分支列表不动', async () => {
+    const { w, gw } = await mountReady()
+    gw.listBranches.mockResolvedValue(BRANCHES)
+    gw.fireReady()
+    await flushPromises()
+    gw.listBranches.mockClear() // mountReady 首连 + 本次重连各预拉一次，清零后从零计数
+    gw.switchBranch.mockRejectedValue(new Error('branch is no longer switchable'))
+
+    await w.find('[data-test="branch-menu"]').trigger('click')
+    await w.findAll('[data-test^="branch-item"]')[1].trigger('click')
+    await flushPromises()
+
+    expect(ElMessage.error).toHaveBeenCalledWith('切换分支失败：branch is no longer switchable')
+    expect(w.find('[data-test="error-bar"]').exists()).toBe(false) // 不进连接横幅
+    expect(gw.listBranches).not.toHaveBeenCalled() // 不重拉
+  })
+})
 })

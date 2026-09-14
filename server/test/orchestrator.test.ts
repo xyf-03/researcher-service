@@ -424,6 +424,25 @@ describe('named volume 编排（#590/#592）', () => {
     expect(fl.runtime.containers.get('nv-default')?.spec.volumes).toEqual(volNames(inst.id))
   })
 
+  it('named volume 拓扑：模板 workspace 经 seedWorkspace 灌卷（provision 的宿主树不进容器）', async () => {
+    const fl = nvFleet()
+    const inst = await fl.orch.createReserve('nv-seed', ownerId)
+    await fl.orch.createComplete(inst, true)
+    // 灌卷源 = server 镜像内模板 workspace（researcher 各项 md + skills，#6xx 链路断裂修复）
+    expect(fl.archive.seedCalls).toEqual([
+      { name: 'nv-seed', hostDir: path.join(fl.config.templateDir, 'workspace') },
+    ])
+    // 顺序：seedWorkspace 先于 writeConfig（create → 灌模板 → 写 config → start，首启即见完整 workspace）
+    expect(fl.archive.ops).toEqual(['seedWorkspace', 'writeConfig'])
+  })
+
+  it('旧 bind 模式：provision 已宿主预填充 home，不再 seedWorkspace', async () => {
+    const fl = oldBindFleet()
+    const inst = await fl.orch.createReserve('bind-noseed', ownerId)
+    await fl.orch.createComplete(inst, true)
+    expect(fl.archive.seedCalls).toEqual([])
+  })
+
   it('显式 false（旧 bind）：spec 不携带 volumes（旧行为保留）', async () => {
     const fl = oldBindFleet()
     const inst = await fl.orch.createReserve('old-bind', ownerId)

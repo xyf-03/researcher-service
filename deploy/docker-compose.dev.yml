@@ -29,7 +29,8 @@
 #        git clone --depth 1 https://github.com/ACautomata/researcher ./researcher
 #      或设 RESEARCHER_DIR 指向已有克隆。
 #   2. （真编排需）备派生镜像 + LLM key（config.ts dev 缺省可起控制面/登录，建容器才需）：
-#        docker build -t ghcr.io/acautomata/researcher-service/openclaw:latest deploy/openclaw-image
+#        镜像 tag 须 = Dockerfile FROM 基线版本 tag（config 默认目标镜像已钉版，issue #695；本
+#        compose 不覆盖 OPENCLAW_IMAGE）——构建命令见 deploy/README.md「派生镜像版本 tag 约定」。
 #        export LLM_API_KEY=...
 #   3. 起栈：docker compose -f deploy/docker-compose.dev.yml up -d --build
 #   4. 前端：cd frontend && npm run dev（vite proxy /api、/ws → 127.0.0.1:8001）

@@ -18,6 +18,19 @@ export function isTokenExpired(token: string): boolean {
   }
 }
 
+// 从 JWT access token 解出本地隔离用身份串（payload.sub ?? payload.username）。
+// issue #668：chat 草稿（draftOwner）与面板三态宽度（panelWidth）两处 localStorage
+// 按用户隔离共用——解析失败回退 token 本体（token 间天然隔离），空 token 回退 'signed-out'。
+export function tokenOwner(token: string): string {
+  try {
+    const part = token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')
+    const payload = JSON.parse(atob(part.padEnd(Math.ceil(part.length / 4) * 4, '='))) as Record<string, unknown>
+    const identity = payload.sub ?? payload.username
+    if (typeof identity === 'string' && identity) return identity
+  } catch { /* malformed token falls through to token-scoped isolation */ }
+  return token || 'signed-out'
+}
+
 // 读取失败响应并抛出含后端真实错误消息的 Error（校验消息，见 api/errors.ts）。
 // #312 信封：HTTP 200 + code!==0 → 抛信封 message；非信封 → HTTP 状态 + 字段级 body。
 // body 由调用方一次读取传入（Response body 只可读一次，避免二次 json() 抛错）。

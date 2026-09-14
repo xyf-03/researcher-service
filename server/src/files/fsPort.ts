@@ -61,4 +61,10 @@ export interface FileArchive {
   // 「create 容器后写 config 再 start」，首启即读到渲染配置。读不存在 → FileNotFound。
   writeConfig(name: string, content: string): Promise<void>
   readConfig(name: string): Promise<string>
+  // 模板 workspace 灌卷（#6xx · named volume 拓扑下 researcher workspace 预填充）：把控制面侧
+  // hostDir 目录树递归打成 tar、putArchive 解包进容器内 ~/.openclaw/workspace（覆盖同名路径——
+  // 镜像骨架被 researcher 模板取代）。内部机制（createComplete 编排，REST 不可达）；hostDir 是
+  // 控制面侧源目录（OPENCLAW_TEMPLATE_DIR/workspace），非容器路径。目录不存在 → 抛错（fail-fast，
+  // 对齐「不带病出容器」——与 provision 的 cp 失败同语义）。符号链接不灌（保守跳过）。
+  seedWorkspace(name: string, hostDir: string): Promise<void>
 }

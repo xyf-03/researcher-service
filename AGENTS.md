@@ -43,7 +43,8 @@ npm run build                                  # vue-tsc 类型检查 + vite bui
 # 起服务 / 真编排 OpenClaw 容器（named volume 拓扑）一律走此；纯逻辑迭代仍用上方宿主 npm test/typecheck。
 docker compose -f deploy/docker-compose.dev.yml up -d --build   # server+redis，挂 docker.sock，server:8001
 # 前置：researcher 克隆到仓库根（build context template=../researcher，或设 RESEARCHER_DIR）；
-#       真编排另需派生镜像（docker build deploy/openclaw-image）+ export LLM_API_KEY。详见 deploy/README.md。
+#       真编排另需派生镜像（构建须打成 Dockerfile FROM 基线版本 tag，命令见 deploy/README.md）
+#       + export LLM_API_KEY。
 ```
 
 ## 架构总览

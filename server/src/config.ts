@@ -2,6 +2,7 @@ import 'dotenv/config'
 import { accessSync, constants, existsSync, statSync } from 'node:fs'
 import path from 'node:path'
 import { isQuotaValid, QUOTA_MAX } from './auth/quota'
+import { isFloatingImageRef } from './containers/imageRef'
 import { parseEncryptionKeys } from './crypto'
 
 // 控制面配置：全部来自环境变量，带 dev 友好默认。生产缺关键项时 fail-fast。
@@ -147,6 +148,26 @@ function readFleetRoot(): string {
     )
   }
   return raw ?? fallback
+}
+
+// OPENCLAW_IMAGE（#695，spec §2.1 升级编排的版本前提）：容器 fleet 的目标镜像——创建时钉进容器，
+// 升级编排的检测判定是「容器记录镜像 ≠ 当前目标」。默认 = 本仓库派生镜像 + 精确版本 tag，版本与
+// deploy/openclaw-image/Dockerfile FROM 基线同源（两处明文由 openclawImage.test.ts 交叉断言锁死，
+// 防双源漂移；版本 tag 一经发布不可移动，换内容须 bump 版本，见 deploy/README.md）。
+// 生产浮动引用（无 tag 或 :latest）→ 启动 fail-fast：浮动 tag 让「当前目标」随上游移动，升级
+// 不可复现/不可 review（对齐 readTemplateDir/readFleetRoot 前置校验模式）；dev/test 容忍浮动
+//（本地调试可覆盖回官方 :latest）。**无 dev 旁路分支**（父 spec #693 §2.1「dev 不旁路检测机制」
+// = 不为 dev 另写一条路径）：dev/prod 共用本函数与同一准据 isFloatingImageRef，仅按 NODE_ENV
+// 决定是否抛错——「生产必拦 / dev 放行」是同一判定的两种门控结果，不是两套实现。
+function readFleetImage(): string {
+  const v =
+    process.env.OPENCLAW_IMAGE ?? 'ghcr.io/acautomata/researcher-service/openclaw:2026.9.4-browser'
+  if (process.env.NODE_ENV === 'production' && isFloatingImageRef(v)) {
+    throw new Error(
+      `OPENCLAW_IMAGE 为浮动镜像引用（无 tag 或 :latest）: ${JSON.stringify(v)}，生产须钉精确版本 tag（版本源见 deploy/openclaw-image/Dockerfile FROM 基线）`,
+    )
+  }
+  return v
 }
 
 // PANEL_PUBLIC_ORIGIN（#385 生产 Origin 接线）：面板对外的 origin（浏览器经它访问面板），后端
@@ -313,10 +334,9 @@ export const config = {
       templateDir: readTemplateDir(),
       // openclaw.json 模板文件（配置单一来源）
       templateJson: process.env.OPENCLAW_TEMPLATE_JSON ?? `${process.cwd()}/../deploy/openclaw.json`,
-      // OpenClaw 容器镜像：默认本仓库派生镜像（ghcr.io/.../openclaw，ADR 0013：pdftotext +
-      // wiki/workspace 骨架，CD 随发布构建推送）；可用 OPENCLAW_IMAGE 覆盖（如官方基线）
-      image:
-        process.env.OPENCLAW_IMAGE ?? 'ghcr.io/acautomata/researcher-service/openclaw:latest',
+      // OpenClaw 容器镜像：默认本仓库派生镜像 + 精确版本 tag（ADR 0013：pdftotext + wiki/workspace
+      // 骨架，CD 随发布构建推送）；可用 OPENCLAW_IMAGE 覆盖（生产禁浮动 tag → readFleetImage fail-fast）
+      image: readFleetImage(),
       portStart,
       portEnd,
       // 全面板共享 LLM_API_KEY（敏感值）；生产必填（create 时前置校验 → 90003）

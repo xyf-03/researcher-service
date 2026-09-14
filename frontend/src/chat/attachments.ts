@@ -39,11 +39,33 @@ export const MAX_ATTACHMENT_BYTES = 700 * 1024
 // 放行，累积超预算的后续附件拒发（采集层 #463 可据 rejected 提示「附件合计过大」）。
 export const MAX_TOTAL_BYTES = MAX_ATTACHMENT_BYTES
 
-// 类型白名单（放行 image/audio/video 前缀——与 #464 渲染范围对齐；文档等仅发送、渲染层不处理，
-// 但须挡攻击者塞大字节进 free-form content 爆破帧上限）。mimeType 缺失/空前缀不匹配一律拦截。
+// 类型白名单（放行 image/audio/video 前缀 + 文档 mime——文档走官方第 4 块类型 document，
+// 渲染层下载卡呈现；与 ChatMessageItem SAFE_DOCUMENT_MIMES 对齐 + text/markdown，两处清单须
+// 同步改。仍须挡攻击者塞大字节进 free-form content 爆破帧上限）。mimeType 缺失/空前缀不匹配一律拦截。
 export function isAllowedAttachmentType(mimeType: string | undefined): boolean {
-  if (typeof mimeType !== 'string' || !mimeType) return false
-  return mimeType.startsWith('image/') || mimeType.startsWith('audio/') || mimeType.startsWith('video/')
+  return attachmentTypeOf(mimeType) !== null
+}
+
+// 文档 mime 清单（发送侧白名单 = 渲染侧 SAFE_DOCUMENT_MIMES ∪ text/markdown；同步改两处）。
+// 未知二进制（octet-stream）与渲染卡不认的 office mime 不放行——发了渲染不出，徒增帧体积风险。
+const DOCUMENT_MIMES: ReadonlySet<string> = new Set([
+  'application/pdf',
+  'text/plain',
+  'text/markdown',
+  'text/csv',
+  'application/json',
+  'application/zip',
+  'application/gzip',
+  'application/x-tar',
+])
+
+// mime → 官方附件块类型（image/audio/video 主段直映射；文档 mime → document；白名单外 → null）。
+// 派生结果即 chat.send attachments[].type 与 MediaBlock.type（渲染按此分派）。
+export function attachmentTypeOf(mimeType: string | undefined): string | null {
+  if (typeof mimeType !== 'string' || !mimeType) return null
+  const main = mimeType.split('/')[0].toLowerCase()
+  if (main === 'image' || main === 'audio' || main === 'video') return main
+  return DOCUMENT_MIMES.has(mimeType.toLowerCase()) ? 'document' : null
 }
 
 // ---- #459-T2 #463：采集层（压缩 + 文件转换）----
@@ -117,18 +139,35 @@ export async function compressImageFile(
   }
 }
 
+// 浏览器未注册 mime 的常见文档扩展名（File.type 为空串）→ 按扩展名派生（只覆盖文档白名单内
+// 类型；.md 是典型——浏览器对 .md 不给 mime，不派生则一切 markdown 文件都被白名单拦）。
+const EXT_MIME: Readonly<Record<string, string>> = {
+  md: 'text/markdown',
+  markdown: 'text/markdown',
+  txt: 'text/plain',
+  csv: 'text/csv',
+  json: 'application/json',
+  pdf: 'application/pdf',
+  zip: 'application/zip',
+  gz: 'application/gzip',
+  tar: 'application/x-tar',
+}
+
 // 非图片/通用文件 → RawAttachment：FileReader 读为 dataURL → content 剥前缀存纯 base64（#4）+
-// fileName/mimeType/sizeBytes（真实字节 file.size，#7）+ type 从 mimeType 主段派生（image/audio/video）。
-// 体积校验交下游 buildAttachments（>700KB 拒发），本函数不判。
+// fileName/mimeType/sizeBytes（真实字节 file.size，#7）+ type 经 attachmentTypeOf 派生（image/
+// audio/video/document；无 mime 按扩展名补 mime 后再派生）。体积校验交下游 buildAttachments
+// （>700KB 拒发），本函数不判。
 export function fileToRawAttachment(file: File): Promise<RawAttachment> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader()
     reader.onerror = () => reject(reader.error ?? new Error('read failed'))
     reader.onload = () => {
       const dataUrl = typeof reader.result === 'string' ? reader.result : ''
+      const ext = file.name.includes('.') ? file.name.split('.').pop()!.toLowerCase() : ''
+      const mimeType = file.type || EXT_MIME[ext] || ''
       resolve({
-        type: file.type.split('/')[0],
-        mimeType: file.type,
+        type: attachmentTypeOf(mimeType) ?? '',
+        mimeType,
         fileName: file.name,
         content: stripDataUrlPrefix(dataUrl),
         sizeBytes: file.size,
@@ -153,6 +192,20 @@ function base64ByteCount(base64: string): number {
   if (len === 0) return 0
   const padding = base64.endsWith('==') ? 2 : base64.endsWith('=') ? 1 : 0
   return Math.floor((len * 3) / 4) - padding
+}
+
+// ---- #694 回退回填 ----
+
+// 修改类会话控制 RPC（`sessions.rewind` / `sessions.fork`）响应里 `editorAttachments` 元素
+// （官方 wire 形状 `{mimeType, data}`，data 为纯 base64）→ RawAttachment（与采集层同形状，预览条/
+// 发送校验共用）。**必须补 sizeBytes**（Codex #703 P2）：缺它时下游 attachmentByteCount 退化为
+// 「按 base64 字符数当字节数」（×4/3 高估），会让真实体积落在 (525KB, 700KB] 的图——本面板压缩后
+// 正常发出过的图——在回退后重发被误判超限。折算与采集层 compressImageFile 同一口径
+// （base64ByteCount）。白名单外的 mime（网关异常/新类型）→ null，调用方丢弃。
+export function editorAttachmentToRaw(a: { mimeType: string; data: string }): RawAttachment | null {
+  const type = attachmentTypeOf(a.mimeType)
+  if (!type) return null
+  return { type, mimeType: a.mimeType, content: a.data, sizeBytes: base64ByteCount(a.data) }
 }
 
 // 浏览器 canvas 默认引擎：单次解码（一个 objectURL + 一次 Image 加载）供 loadSize/render 共用——

@@ -1,13 +1,29 @@
 // 假 docker runtime（接缝 #5：注入编排器测 5 态机 + 取消标志 + 端口入队前分配 + 补偿，不需真 daemon）。
 // 全内存模拟 ContainerRuntime：run/get/stop/remove/listFleet/hostPublishedPorts/exec 各原语可注入故障。
 
-import type { ContainerInfo, ContainerRuntime, ContainerSpec, NamedVolumes } from '../src/containers/runtime'
+import type {
+  ContainerInfo,
+  ContainerRuntime,
+  ContainerSpec,
+  NamedVolumes,
+  OneShotResult,
+  OneShotSpec,
+} from '../src/containers/runtime'
 import { containerName, volumeOrder } from '../src/containers/runtime'
+import { RunOnceError } from '../src/containers/errors'
 import { GATEWAY_INTERNAL_PORT, LABEL_INSTANCE_KEY, LABEL_PORT_KEY } from '../src/containers/constants'
 
 export interface FakeContainerRecord {
   info: ContainerInfo
   spec: ContainerSpec
+}
+
+// #696 一次性临时容器记录：断言「临时容器不进 fleet 列表 / 不参与端口对账（全路径清理）」。
+export interface FakeOneShotRecord {
+  spec: OneShotSpec
+  output: string
+  exitCode: number
+  removed: boolean
 }
 
 export class FakeRuntime implements ContainerRuntime {
@@ -27,6 +43,11 @@ export class FakeRuntime implements ContainerRuntime {
   failExecSyncFor = new Set<string>()
   // execSync 调用记录（断言 delete 的 chown / approve 的 CLI argv）。
   execCalls: { name: string; cmd: string[] }[] = []
+  // #696 一次性临时容器：调用记录 + 故障注入（退出码/输出/等待退出抛错）。
+  readonly oneshotRuns: FakeOneShotRecord[] = []
+  oneshotExitCode = 0
+  oneshotOutput = ''
+  oneshotWaitError: Error | null = null
   // #590：remove 收到 volumes 时的卷删除记录（断言 named volume 模式连带 docker volume rm 三卷）。
   removedVolumes: string[] = []
 
@@ -123,6 +144,26 @@ export class FakeRuntime implements ContainerRuntime {
   async execSync(name: string, cmd: string[]): Promise<void> {
     if (this.failExecSyncFor.has(name)) throw new Error(`simulated approve exec failure for ${name}`)
     this.execCalls.push({ name, cmd })
+  }
+
+  // #696 一次性临时容器：记录 → 按注入的退出码 resolve/抛 RunOnceError → finally 标清理。
+  // 刻意不进 this.containers——临时容器对 listFleet / hostPublishedPorts 不可见（真 runtime 靠
+  // 「无 fleet 标签 + 无端口发布」达成同一效果，见 DockerRuntime.buildOneShotOptions）。
+  async runOnce(spec: OneShotSpec): Promise<OneShotResult> {
+    const rec: FakeOneShotRecord = {
+      spec,
+      output: this.oneshotOutput,
+      exitCode: this.oneshotExitCode,
+      removed: false,
+    }
+    this.oneshotRuns.push(rec)
+    try {
+      if (this.oneshotWaitError) throw this.oneshotWaitError
+      if (rec.exitCode !== 0) throw new RunOnceError(rec.exitCode, rec.output, spec.cmd)
+      return { output: rec.output }
+    } finally {
+      rec.removed = true
+    }
   }
 
   // 测试辅助：断言用的 label 常量（与真 runtime 同源）。

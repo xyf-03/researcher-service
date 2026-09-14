@@ -10,7 +10,11 @@ import {
   LABEL_APP_KEY,
   LABEL_APP_VALUE,
   LABEL_INSTANCE_KEY,
+  LABEL_ONESHOT_KEY,
+  LABEL_ONESHOT_VALUE,
   LABEL_PORT_KEY,
+  MOUNT_WIKI,
+  MOUNT_WORKSPACE,
 } from './constants'
 import {
   containerName,
@@ -19,7 +23,10 @@ import {
   type ContainerRuntime,
   type ContainerSpec,
   type NamedVolumes,
+  type OneShotResult,
+  type OneShotSpec,
 } from './runtime'
+import { RunOnceError } from './errors'
 
 // 4 个 sync flag 全关（防覆写挂载的 openclaw.json / 防明文写凭证；对官方镜像无害、兼容 fork init.sh）。
 const SYNC_FLAGS_OFF: Record<string, string> = {
@@ -55,6 +62,35 @@ function envRecordToArray(env: Record<string, string>): string[] {
   return Object.entries(env).map(([k, v]) => `${k}=${v}`)
 }
 
+// 面板创建的容器（fleet 实例 / 一次性临时容器）共用的环境基线：镜像行为不变的 BASE_ENV + 关闭镜像侧
+// config 同步的 SYNC_FLAGS_OFF。单一构造点——两处各写一份会在新增容器类型时漂移（一次性容器漏关
+// SYNC_*，doctor 就会去改写挂载卷里的配置）。
+function panelEnv(): Record<string, string> {
+  return { ...BASE_ENV, ...SYNC_FLAGS_OFF }
+}
+
+// named volume 挂载的唯一构造点（fleet 三卷与一次性临时容器共用同一形状——两处手写会漂移）。
+function volumeMount(source: string, target: string, readOnly = false): Docker.MountSettings {
+  return { Type: 'volume', Source: source, Target: target, ...(readOnly ? { ReadOnly: true } : {}) }
+}
+
+// docker 容器日志多路复用帧解析（#696）：非 TTY 容器的 logs 响应为逐帧
+// [stream(1=stdout/2=stderr),0,0,0,size_be32] + 负载；先收齐各帧负载再整体解码（跨帧切开的多字节
+// 字符不裂成替换符），stdout/stderr 合并成诊断文本。首个帧头即无效（daemon 直返原文）→ 原样返回；
+// 空帧/残缺帧视为帧流结束，已收齐的帧照常返回——绝不因解析错位把整段日志吞掉。
+function demuxLogFrames(raw: Buffer): string {
+  const payloads: Buffer[] = []
+  let off = 0
+  while (off + 8 <= raw.length) {
+    const size = raw.readUInt32BE(off + 4)
+    if (size === 0 || off + 8 + size > raw.length) break
+    payloads.push(raw.subarray(off + 8, off + 8 + size))
+    off += 8 + size
+  }
+  if (off === 0) return raw.toString('utf8') // 无有效帧头 → 原文
+  return Buffer.concat(payloads).toString('utf8')
+}
+
 export class DockerRuntime implements ContainerRuntime {
   private cached: Docker | null = null
 
@@ -72,8 +108,7 @@ export class DockerRuntime implements ContainerRuntime {
   // 构造 docker create 参数（纯逻辑，可单测）。
   buildRunOptions(spec: ContainerSpec): Docker.ContainerCreateOptions {
     const environment = {
-      ...BASE_ENV,
-      ...SYNC_FLAGS_OFF,
+      ...panelEnv(),
       GATEWAY_TOKEN: spec.gatewayToken,
       // 容器内 sidecar CLI（approve/exec 审批注册）自连 gateway 须同值 token
       OPENCLAW_GATEWAY_TOKEN: spec.gatewayToken,
@@ -83,9 +118,9 @@ export class DockerRuntime implements ContainerRuntime {
     // （#591：openclaw.json 落 ~/.openclaw/ 默认路径，静态 config）。
     const mounts: Docker.MountSettings[] | undefined = spec.volumes
       ? [
-          { Type: 'volume', Source: spec.volumes.wiki, Target: `${HOME_BIND}/wiki/main` },
-          { Type: 'volume', Source: spec.volumes.workspace, Target: `${HOME_BIND}/workspace` },
-          { Type: 'volume', Source: spec.volumes.home, Target: HOME_BIND },
+          volumeMount(spec.volumes.wiki, MOUNT_WIKI),
+          volumeMount(spec.volumes.workspace, MOUNT_WORKSPACE),
+          volumeMount(spec.volumes.home, HOME_BIND),
         ]
       : undefined
     return {
@@ -117,6 +152,31 @@ export class DockerRuntime implements ContainerRuntime {
           [`${GATEWAY_INTERNAL_PORT}/tcp`]: [{ HostIp: this.publishHost, HostPort: String(spec.hostPort) }],
         },
         RestartPolicy: { Name: 'unless-stopped' },
+      },
+    }
+  }
+
+  // 构造一次性临时容器 create 参数（纯逻辑，可单测，#696）。「对 fleet 列表与端口对账不可见」的三处
+  // 刻意差异即在此固定：
+  //  ① 标签只有 oneshot 标记——不写 app=openclaw-fleet / openclaw.instance / openclaw.port，
+  //     故 listFleet（按 app label 过滤）看不到它；
+  //  ② 无 PortBindings/ExposedPorts——不占宿主端口，端口对账（按发布端口聚合）看不到它；
+  //  ③ Entrypoint 覆写为 spec.cmd 且 Cmd 清空——既不依赖镜像 ENTRYPOINT（官方镜像为 tini）转发
+  //     命令，也不让镜像 Cmd（node openclaw.mjs gateway）被当作参数追加到命令之后。
+  // 无 RestartPolicy（默认 no）：一次性容器跑完即弃，绝不自动重启。
+  buildOneShotOptions(spec: OneShotSpec): Docker.ContainerCreateOptions {
+    const environment = { ...panelEnv(), ...spec.env }
+    return {
+      Image: spec.image,
+      Entrypoint: [...spec.cmd],
+      Cmd: [],
+      Env: envRecordToArray(environment),
+      User: '0:0',
+      Labels: { [LABEL_ONESHOT_KEY]: LABEL_ONESHOT_VALUE },
+      HostConfig: {
+        ...(spec.mounts
+          ? { Mounts: spec.mounts.map((m) => volumeMount(m.source, m.target, m.readOnly === true)) }
+          : {}),
       },
     }
   }
@@ -162,6 +222,44 @@ export class DockerRuntime implements ContainerRuntime {
       filters: { label: [`${LABEL_APP_KEY}=${LABEL_APP_VALUE}`] },
     })
     return cs.map((c) => this.toInfo(c))
+  }
+
+  // 一次性临时容器（#696）：创建（无 fleet 标签/无端口，见 buildOneShotOptions）→ 启动 → 等退出
+  // → 强制删容器。成功（退出码 0）返回日志文本；非 0 抛 RunOnceError（携带退出码与输出）；
+  // 三路（成功/非 0/异常）都清理容器。未设超时——调用命令是面板自派的（tar/doctor），
+  // 卡死由编排层（#699）的容器生命周期兜底。
+  async runOnce(spec: OneShotSpec): Promise<OneShotResult> {
+    await this.ensureImage(spec.image)
+    const container = await this.client().createContainer(this.buildOneShotOptions(spec))
+    try {
+      await container.start()
+      const { StatusCode } = (await container.wait()) as { StatusCode: number }
+      const output = await this.logsText(container)
+      if (StatusCode !== 0) throw new RunOnceError(StatusCode, output, spec.cmd)
+      return { output }
+    } finally {
+      await this.removeOneShot(container)
+    }
+  }
+
+  // 删一次性临时容器（force）。只删容器、不删卷——挂载的卷是调用方资产（如备份卷），须留存。
+  // 清理失败只告警不上抛：否则会掩盖主结果（命令已成功却被报成失败；非 0 退出的诊断被删除错误替换）。
+  private async removeOneShot(container: Docker.Container): Promise<void> {
+    try {
+      await container.remove({ force: true })
+    } catch (e) {
+      console.warn(`[fleet] oneshot container cleanup failed: ${(e as Error).message}`)
+    }
+  }
+
+  // 读容器日志（诊断用途，尽力而为）：读失败返回空串——日志是附加信息，绝不改变命令结果判定。
+  private async logsText(container: Docker.Container): Promise<string> {
+    try {
+      const raw = await container.logs({ stdout: true, stderr: true })
+      return demuxLogFrames(Buffer.from(raw))
+    } catch {
+      return ''
+    }
   }
 
   // 枚举宿主上与发布地址冲突的活动容器宿主端口（含未跟踪容器；daemon 不可达 → 空集）。

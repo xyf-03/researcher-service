@@ -4,7 +4,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createPinia, setActivePinia } from 'pinia'
 
-import { useAuthStore } from '@/stores/auth'
+import { useAuthStore, tokenOwner } from '@/stores/auth'
 
 // 复刻 api/client.test.ts 的 Response mock 形态。
 function mockResp(body: unknown, status = 200): Response {
@@ -158,5 +158,28 @@ describe('auth #312 信封语义', () => {
     )
     await auth.forceRefresh()
     expect(auth.refreshExhausted).toBe(false)
+  })
+})
+
+// issue #668：JWT→身份串解析（chat 草稿与面板三态宽度两处 localStorage 按用户隔离共用）。
+describe('tokenOwner', () => {
+  function jwt(payload: Record<string, unknown>): string {
+    const body = btoa(JSON.stringify(payload)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+    return `header.${body}.sig`
+  }
+
+  it('JWT payload.sub 优先，无 sub 回退 username', () => {
+    expect(tokenOwner(jwt({ sub: 'alice', username: 'bob' }))).toBe('alice')
+    expect(tokenOwner(jwt({ username: 'bob' }))).toBe('bob')
+  })
+
+  it('malformed token 回退 token 本体（token 间天然隔离），空 token 回退 signed-out', () => {
+    expect(tokenOwner('not-a-jwt')).toBe('not-a-jwt')
+    expect(tokenOwner('')).toBe('signed-out')
+  })
+
+  it('sub 为空串回退 token 本体（?? 语义：空串不回退 username）', () => {
+    const token = jwt({ sub: '', username: 'bob' })
+    expect(tokenOwner(token)).toBe(token)
   })
 })

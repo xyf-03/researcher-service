@@ -1,7 +1,9 @@
 // 容器/编排域异常族（平移 backend/containers/fleet/values.py + ports.py，#334）。
 // 区别于旧 Django「异常→HTTP 状态码」：本服务全部经信封码（#312 所有 REST HTTP 200）。
-// 每个异常携带 code 字段，路由层不再逐类 catch —— 抛出的领域异常统一由
-// toEnvelopeError 转译为 EnvelopeError（code 即信封码）。
+// 带信封码的异常一律继承 ContainerDomainError，路由层不再逐类 catch —— 由 toEnvelopeError
+// 转译为 EnvelopeError（code 即信封码）。**不携带 code 的例外**直接继承 Error、与库内其他异常
+// 同形（无码面语义、调用方按类型捕获）：ConfigWriteError（models service 判「盘未变」）、
+// RunOnceError（升级编排判命令失败）。
 
 import { CODE } from '../codes'
 
@@ -92,5 +94,21 @@ export class ConfigWriteError extends Error {
   ) {
     super(`config write failed for ${containerName}: ${path}`)
     this.name = 'ConfigWriteError'
+  }
+}
+
+// 一次性临时容器（runOnce）以非 0 退出（#696）：携带退出码与输出，供升级编排判定失败语义并如实
+// 记录日志（如 `openclaw doctor --fix` 的输出）。与 ConfigWriteError 同类：刻意不继承
+// ContainerDomainError（无信封码，编排层消费，不经 REST 直达用户）。
+export class RunOnceError extends Error {
+  constructor(
+    public readonly exitCode: number,
+    public readonly output: string,
+    public readonly cmd: readonly string[],
+  ) {
+    super(
+      `runOnce exited with code ${exitCode}: cmd=${JSON.stringify(cmd)} output=${JSON.stringify(output.slice(0, 500))}`,
+    )
+    this.name = 'RunOnceError'
   }
 }

@@ -52,6 +52,63 @@ export interface CommandDTO {
   aliases: string[]
 }
 
+// #694 会话控制（rewind/fork/分支）DTO —— 对齐官方 sessions.rewind / sessions.fork 结果 schema。
+// editorAttachments 为被剪消息里的图片附件（base64，网关侧上限 10 张 / 单张 ≤5MiB）；回填 composer
+// 的合并与体积校验由调用层负责（附件采集层同款白名单）。
+export interface EditorAttachmentDTO {
+  mimeType: string
+  data: string
+}
+
+export interface RewindResultDTO {
+  editorText: string
+  editorAttachments: EditorAttachmentDTO[]
+}
+
+// #697 对话 fork（#693 spec 前端线）：sessions.fork 与 rewind 同形请求、同形 editor 载荷，
+// 差异仅结果多必有 sessionKey（新会话 key——prependSession/pickSession 导航编排的前提）。
+export interface ForkResultDTO extends RewindResultDTO {
+  sessionKey: string
+}
+
+// rewind/fork 结果的 editor 载荷 0 信任校准（#694 rewind 先例，#697 抽为共享——两路校准口径
+// 必须同源，漂移即重蹈 #694 sizeBytes 高估 bug）：缺失/异形一律回落空载荷，语义 =「无回填」。
+function parseEditorPayload(res: unknown): { editorText: string; editorAttachments: EditorAttachmentDTO[] } {
+  const rec = (res && typeof res === 'object' ? res : {}) as Record<string, unknown>
+  const editorText = typeof rec.editorText === 'string' ? rec.editorText : ''
+  const raw = Array.isArray(rec.editorAttachments) ? rec.editorAttachments : []
+  const editorAttachments: EditorAttachmentDTO[] = []
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue
+    const att = item as Record<string, unknown>
+    const mimeType = typeof att.mimeType === 'string' ? att.mimeType : ''
+    const data = typeof att.data === 'string' ? att.data : ''
+    if (!mimeType || !data) continue // 空 mimeType/空 data 渲染不出也发不出，丢弃
+    editorAttachments.push({ mimeType, data })
+  }
+  return { editorText, editorAttachments }
+}
+// #698 分支菜单（#693 spec §4）：sessions.branches.list 的逐分支投影。headline 空串的回退文案
+//（「未命名分支」）归 UI 层；messageCount/updatedAt 是可选展示字段（校准层置 undefined → 槽位不渲染）。
+export interface SessionBranchDTO {
+  leafEntryId: string // sessions.branches.switch 的定位参数（注意参数名非 entryId）
+  headline: string // 最新消息摘要（网关侧 ≤120 字符契约；前端不二次截断，单行省略归 CSS）
+  messageCount?: number
+  updatedAt?: string // ISO
+  active: boolean // CAS leaf 基准唯一权威（active:true 项的 leafEntryId，#693 spec §1.2）
+}
+
+// #694 会话控制能力探测方法集（#693 spec §1.1）：hello-ok.features.methods 须**全部**在位才判「可用」
+// ——四个方法同属一个功能族（会话控制 RPC），任一缺失即该代网关不支持该族（过渡期存量 7.1 镜像
+// 无 features 字段），UI 据此隐藏回退/fork/分支全部入口，而非点出必然报错的按钮。单一来源：
+// rewind（#694）与 fork（#697）都消费这同一判定；branches 由后续票复用（避免各自维护子集而语义漂移）。
+const SESSION_CONTROL_METHODS = [
+  'sessions.rewind',
+  'sessions.fork',
+  'sessions.branches.list',
+  'sessions.branches.switch',
+] as const
+
 // 连接级事件回调（对齐 ChatView 现有 ws handlers 签名，渲染逻辑零改动）。
 export interface GatewayChatHandlers {
   // 协议机完成 v4 握手（hello-ok）——首连与自动重连成功后都会触发
@@ -77,10 +134,38 @@ export interface GatewayChat {
   // 主动关隧道触发协议机重连决策（连接期超时兜底：SYN 黑洞下 socket 永不 open、无任何信号，
   // 主动关闭让协议机走退避重连自愈——P1 code review）
   closeSocket(code?: number, reason?: string): void
+  // #694 会话控制能力（#693 spec §1.1）：当前连接对端网关是否支持 rewind/fork/分支 RPC。单一来源 =
+  // 最近一次 hello-ok 的 features.methods 快照（onConnectHello 刷新，每次重连跟着新 hello 走）。
+  // 未握手 / 旧网关（7.1 无 features）/ 方法集不全 → false → UI 隐藏全部会话控制入口。
+  sessionControlAvailable(): boolean
   listSessions(): Promise<SessionDTO[]>
   createSession(label?: string): Promise<string>
   deleteSession(key: string): Promise<void>
-  getHistory(sessionKey: string, limit?: number, messageId?: string): Promise<SessionHistoryDTO>
+  // 历史分页锚点 cursor 多态（`string | number`）：网关 chat.history 区分数值 offset 与字符串
+  // messageId 两种锚点（docs.openclaw.ai/gateway/protocol）——实现按运行时类型分发：number →
+  // offset（数值偏移分页）、string → messageId（锚点）。调用方须保留 nextOffset 原始类型，不得
+  // String() 化（否则数值偏移错走 messageId 字段，offset 分页会话第二页起拉错，Codex #678 P1）。
+  getHistory(sessionKey: string, limit?: number, cursor?: string | number): Promise<SessionHistoryDTO>
+  // #694 对话回退（#693 spec §1.4）：把该持久化 user message（entryId）之后的历史从活跃路径剪除，
+  // 返回被剪首条用户消息文本与图片附件供回填 composer 编辑重发。entryId 来自历史消息的
+  // __openclaw.id（translateHistoryMessage 提取的 Msg.entryId）——本地乐观 echo 无 entryId，
+  // 不可作参数。权限 operator.admin（已在 OPERATOR_SCOPES）。失败原样上抛（GatewayProtocolRequestError，
+  // details 携带网关语义），调用层不重试、如实提示。
+  rewind(sessionKey: string, entryId: string): Promise<RewindResultDTO>
+  // #697 对话 fork（#693 spec 前端线）：从该持久化 user message（entryId）之前的活跃路径前缀
+  // 创建新会话，返回新 sessionKey + 被点消息的文本/图片附件（播种新会话 composer）。entryId 语义
+  // 同 rewind（resolveMessageCut 同源），原样透传。权限 operator.write。源会话完全不动（不清队列、
+  // 不换 generation）。sessionKey 异形 → 整单判失败（导航无前提，不得回落空结果）。
+  forkEntry(sessionKey: string, entryId: string): Promise<ForkResultDTO>
+  // #698 分支菜单（#693 spec §1.1）：列出会话全部分支（含 active 标记）。0 信任校准惯例：逐字段
+  // typeof 门——leafEntryId 是 switch 的定位参数，缺/空/非 string 跳整项（看得见切不了的死菜单项
+  // 不入列）；纯展示字段（headline/messageCount/updatedAt）异形只降级不砍项。权限 operator.read。
+  // 失败原样上抛（调用层静默降级：按钮不渲染即降级语义）。
+  listBranches(sessionKey: string): Promise<SessionBranchDTO[]>
+  // #698 分支切换：把活跃路径切到该分支（leafEntryId 定位）。简单透传（resolveApproval 惯例）；
+  // no-op 选已活跃分支 = INVALID_REQUEST typed error（UI 层 active 项 disabled，从不发起）。
+  // 权限 operator.admin。
+  switchBranch(sessionKey: string, leafEntryId: string): Promise<void>
   // chat.send RPC 响应携带网关分配的 runId（ackPayload = {runId, status:"started"}，
   // 官方 chat-send-handler）——供 ChatView 首帧归属判别（#53：pendingSend 期间外来/旧 run
   // 首帧与自己的 run 区分，防抢 activeRunId 吞回复）。ack 无 runId（旧网关/异常形状）→ undefined。
@@ -239,6 +324,10 @@ export function createGatewayChat(params: CreateGatewayChatParams): GatewayChat 
   // （lastHelloAt）让此后无 hello 的连续重连失败永远 stable=true、永不 give-up（无限 30s 退避）。
   let thisConnHelloAt = 0
   const STABLE_CONNECTION_MS = 30_000
+  // #694 会话控制能力快照：最近一次 hello-ok 的 features.methods。每次 hello 整体替换（不累积——
+  // 重连到旧网关/升级后的新网关都如实反映当前对端能力）。空集合 = 未握手/7.1 网关 → 能力 false。
+  let advertisedMethods = new Set<string>()
+
   // #377 自动设备配对编排状态机（ADR 0006 B-直连 / issue #377）：首连 bootstrap → PAIRING_REQUIRED
   // {requestId} → 自动 approve → 重连 → hello-ok 下发 deviceToken → acceptHello 持久化（localStorage）→
   // 后续 buildConnectPlan 用 deviceToken。网关重置（token 失效）再遇 PAIRING_REQUIRED → 自动重配对
@@ -484,6 +573,12 @@ export function createGatewayChat(params: CreateGatewayChatParams): GatewayChat 
       for (const frame of translator.translate(event)) handlers.onFrame(frame)
     },
     onConnectHello: (hello, context) => {
+      // #694 会话控制能力快照（0 信任）：hello-ok.features.methods 逐项 string 门后整体替换——旧网关
+      // 无 features 字段（7.1 实测形状）/字段异形一律落空集合 → sessionControlAvailable() 判 false。
+      const methods = hello.features?.methods
+      advertisedMethods = new Set(
+        Array.isArray(methods) ? methods.filter((m): m is string => typeof m === 'string') : [],
+      )
       // #566: 看门狗基准跟 hello-ok 承诺的 policy.tickIntervalMs 走（对齐官方 startTickWatch 的
       // 守卫 + clamp：缺失/无效回退 30s 默认；超小值抬到 1s 地板防巡检热循环误杀；超大值只经
       // resolveSafeTimeoutDelayMs 硬顶 2³¹-1，业务上不约束）。首连与每次自动重连 hello 都触发，
@@ -635,6 +730,8 @@ export function createGatewayChat(params: CreateGatewayChatParams): GatewayChat 
     closeSocket: (code = 1000, reason = '') => {
       client.closeSocket(code, reason)
     },
+    // #694 会话控制能力（见接口注释）：hello 快照 + 全方法集判定。未握手 = 空集合 = false。
+    sessionControlAvailable: () => SESSION_CONTROL_METHODS.every((m) => advertisedMethods.has(m)),
     async listSessions(): Promise<SessionDTO[]> {
       const res = await client.request<{ sessions?: Array<Record<string, unknown>> }>('sessions.list', {
         includeDerivedTitles: true,
@@ -676,13 +773,19 @@ export function createGatewayChat(params: CreateGatewayChatParams): GatewayChat 
       // R4-2）——否则删除被 scope 拒。
       await client.request('sessions.delete', { key })
     },
-    async getHistory(sessionKey: string, limit?: number, messageId?: string): Promise<SessionHistoryDTO> {
+    async getHistory(sessionKey: string, limit?: number, cursor?: string | number): Promise<SessionHistoryDTO> {
       const res = await client.request<{ messages?: unknown; hasMore?: unknown; nextOffset?: unknown }>(
         'chat.history',
         {
           sessionKey,
           ...(limit !== undefined ? { limit } : {}),
-          ...(messageId !== undefined && messageId !== null ? { messageId } : {}),
+          // cursor 类型分发（Codex #678 P1）：number → offset（数值偏移）、string → messageId（锚点）。
+          // 二者是协议两个独立字段；数值偏移若错传为 messageId，offset 分页会话第二页起拉错/拉不到。
+          ...(typeof cursor === 'number'
+            ? { offset: cursor }
+            : cursor !== undefined && cursor !== null
+              ? { messageId: cursor }
+              : {}),
         },
       )
       // 校准（对齐旧代理 _parse_history）：messages 原样透传（display-normalized），非 dict 项跳过
@@ -693,6 +796,53 @@ export function createGatewayChat(params: CreateGatewayChatParams): GatewayChat 
         hasMore: typeof res?.hasMore === 'boolean' ? res.hasMore : false,
         nextOffset: typeof res?.nextOffset === 'string' || typeof res?.nextOffset === 'number' ? res.nextOffset : null,
       }
+    },
+    async rewind(sessionKey: string, entryId: string): Promise<RewindResultDTO> {
+      // 简单透传（resolveApproval/deleteSession 惯例）+ 结果 0 信任校准（parseEditorPayload，与
+      // forkEntry 同源——缺失/异形一律回落空结果，空结果语义即「无回填」）。
+      const res = await client.request('sessions.rewind', {
+        sessionKey,
+        entryId,
+      })
+      return parseEditorPayload(res)
+    },
+    async forkEntry(sessionKey: string, entryId: string): Promise<ForkResultDTO> {
+      // #697：同形透传；sessionKey 是新会话身份（后续导航前提），异形即失败上抛——与 editor
+      // 载荷「回落空」的口径相反，缺失时调用层无从导航，回落会掩盖网关异常。
+      const res = await client.request('sessions.fork', {
+        sessionKey,
+        entryId,
+      })
+      const rec = (res && typeof res === 'object' ? res : {}) as Record<string, unknown>
+      if (typeof rec.sessionKey !== 'string' || !rec.sessionKey) {
+        throw new Error('sessions.fork: response missing sessionKey')
+      }
+      return { sessionKey: rec.sessionKey, ...parseEditorPayload(res) }
+    },
+    // #698：0 信任门表——只有承担后续操作语义的字段（leafEntryId）缺失才砍整项；纯展示字段
+    //（headline/messageCount/updatedAt）异形只降级自己的槽位（#693 spec §1.1「非法项跳过」的
+    // 判定锚点 = 该分支还能否被安全选中与切换）。
+    async listBranches(sessionKey: string): Promise<SessionBranchDTO[]> {
+      const res = await client.request<{ branches?: unknown }>('sessions.branches.list', { sessionKey })
+      const raw = Array.isArray(res?.branches) ? res.branches : []
+      const out: SessionBranchDTO[] = []
+      for (const item of raw) {
+        if (!item || typeof item !== 'object') continue
+        const rec = item as Record<string, unknown>
+        const leafEntryId = typeof rec.leafEntryId === 'string' ? rec.leafEntryId : ''
+        if (!leafEntryId) continue // switch 的定位参数缺不得：死菜单项不入列
+        out.push({
+          leafEntryId,
+          headline: typeof rec.headline === 'string' ? rec.headline : '',
+          messageCount: typeof rec.messageCount === 'number' && Number.isFinite(rec.messageCount) ? rec.messageCount : undefined,
+          updatedAt: typeof rec.updatedAt === 'string' ? rec.updatedAt : undefined,
+          active: typeof rec.active === 'boolean' ? rec.active : false,
+        })
+      }
+      return out
+    },
+    async switchBranch(sessionKey: string, leafEntryId: string): Promise<void> {
+      await client.request('sessions.branches.switch', { sessionKey, leafEntryId })
     },
     async send(sessionKey: string, message: string, attachments?: Attachment[], idempotencyKey?: string): Promise<string | undefined> {
       // chat.send 幂等（schema 必填 idempotencyKey）；返回后流式 delta/final 事件经 onEvent 到达。

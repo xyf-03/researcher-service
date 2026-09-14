@@ -17,7 +17,7 @@
 | `./openclaw.json:ro`（配置模板） | **COPY 进 server 镜像**，CD 不再 scp/挂载模板 |
 | `instances/<id>/config:ro`（openclaw.json 唯一来源） | **写用 `putArchive` 打进容器、读用 `getArchive` 拉出**，零数据 bind |
 
-**自建派生镜像**：`FROM ghcr.io/openclaw/openclaw:2026.7.1-browser`（保 browser 能力，ADR 0003 基线），叠加：①`pdftotext`（poppler，PDF 文本提取 CLI，供 agent `tools.exec` 调用）；②wiki/workspace 骨架 COPY 进 `~/.openclaw`（named volume 首挂自动初始化）。经 `OPENCLAW_IMAGE` 注入。派生镜像不新开谱系，只继承官方谱系已校准性质（CONTEXT.md「镜像谱系」）。
+**自建派生镜像**：`FROM ghcr.io/openclaw/openclaw:2026.9.4-browser`（保 browser 能力，ADR 0003 基线；基线版本 issue #695 起前进，单源 = `deploy/openclaw-image/Dockerfile` 的 `FROM` 行），叠加：①`pdftotext`（poppler，PDF 文本提取 CLI，供 agent `tools.exec` 调用）；②wiki/workspace 骨架 COPY 进 `~/.openclaw`（named volume 首挂自动初始化）。经 `OPENCLAW_IMAGE` 注入。派生镜像不新开谱系，只继承官方谱系已校准性质（CONTEXT.md「镜像谱系」）。
 
 **dev 控制面容器化**：dev 与 prod 同形态（compose 起 server+redis，挂 docker.sock），消除「dev 直跑摸不到 named volume」的分叉。
 

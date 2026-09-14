@@ -2,13 +2,13 @@
 // 单一来源：root 容器内路径 / walk 上限 / 单文件读取上限。供纯逻辑（paths.ts）、
 // docker 适配器（dockerArchive.ts）、测试复用。
 
-import { HOME_BIND } from '../containers/constants'
+import { MOUNT_WIKI, MOUNT_WORKSPACE } from '../containers/constants'
 
-// 两棵树在容器内的固定路径（named volume 挂载点内，#588 派生镜像烤入骨架）。
-// wiki 树根 = ~/.openclaw/wiki/main；workspace 树根 = ~/.openclaw/workspace。
+// 两棵树在容器内的固定路径 = 三卷挂载点（ADR 0011：wiki / workspace / home 是三个互相独立的卷；
+// 单一来源见 containers/constants 的 MOUNT_*，空卷首挂由 #588 派生镜像的骨架初始化）。
 export const FILE_ROOTS: Record<'wiki' | 'workspace', string> = {
-  wiki: `${HOME_BIND}/wiki/main`,
-  workspace: `${HOME_BIND}/workspace`,
+  wiki: MOUNT_WIKI,
+  workspace: MOUNT_WORKSPACE,
 }
 
 // 递归 walk 条目数上限（#586 US9）：巨型目录不拖垮接口——超限即停并标 truncated。

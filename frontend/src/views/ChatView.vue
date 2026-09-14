@@ -12,9 +12,10 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { listInstances } from '@/api/containers'
 import { ApiError } from '@/api/client'
-import { useChatStore } from '@/stores/chat'
+import { useChatStore, type Msg } from '@/stores/chat'
 import { useFileTabsStore } from '@/stores/fileTabs'
-import { useAuthStore } from '@/stores/auth'
+import { useAuthStore, tokenOwner } from '@/stores/auth'
+import { safeLocalStorage } from '@/storage'
 import { useChatConnection } from '@/chat/useChatConnection'
 import {
   buildAttachments,
@@ -23,6 +24,7 @@ import {
   isAllowedAttachmentType,
   toPreviewDataUrl,
   type PendingAttachment,
+  type RawAttachment,
 } from '@/chat/attachments'
 import ChatSidebar from '@/components/chat/ChatSidebar.vue'
 import ChatHeader from '@/components/chat/ChatHeader.vue'
@@ -66,11 +68,21 @@ const conn = useChatConnection({
   onClearError() {
     errorMsg.value = ''
   },
+  // #694（Spec 轴 review）：动作类失败（用户主动发起的回退）走瞬时 toast，不进顶部连接横幅——
+  // 横幅 label 恒「加载失败」，把「回退失败：…」套在其下语义相左；贴 #461 删除会话失败 toast 先例。
+  onActionError(message: string) {
+    ElMessage.error(message)
+  },
   // #459-T2 #463 #1：Enter/斜杠发送统一走 sendMessage（含附件校验/清空预览条），与发送按钮同路径。
   // 箭头闭包延迟求值——sendMessage 为 function 声明提升，Enter 触发时 conn 已就绪。
   onSend() {
     void sendMessage()
   },
+  // #694 回退编排的 composer 协同（#693 spec §1.4）：草稿（文本 + 附件）归本壳，composable 经这两个
+  // 回调抓指纹 / 回填——直接引用两个函数声明（提升，rewind 触发时 pendingAttachments 已就绪），
+  // 不再经一层转手。
+  onRewindDraftFingerprint: draftFingerprint,
+  onEntryBackfill: applyEntryBackfill,
 })
 
 // 嵌套 ref 在模板中不解包（conn 是普通对象）——顶层解构后模板自动解包（slash 匹配单一来源在
@@ -85,6 +97,65 @@ const currentSessionTitle = computed(() => {
 
 // 是否有助手消息正在流式；并发 send 会让旧 streaming 消息永久卡住光标，故流式中禁发
 const streaming = computed(() => chat.messages.some((m) => m.role === 'assistant' && m.streaming))
+
+// #694 回退入口的渲染门（#693 spec §1.5 官方同构 + Codex #703 P1 修订）：网关支持会话控制
+//（hello-ok features 快照）且不在忙碌态时才渲染。忙碌态 = 流式 / 连接中 / 已断线（复用三态）
+// + 回退自身在途（rewindBusy：窗口内投影还是旧代，重入即被编排层吞掉）+ 投影未同步
+//（transcriptSynced：重连后 syncSessions 落地前，可见的是断线前的陈旧条目——此刻回退可能剪除
+// 用户未见的更新轮次；fail-closed，同步失败保持隐藏直至下次权威 loadHistory）。
+const rewindAvailable = computed(
+  () =>
+    conn.sessionControlAvailable.value &&
+    conn.transcriptSynced.value &&
+    !conn.rewindBusy.value &&
+    !conn.forkBusy.value &&
+    !streaming.value &&
+    !connecting.value &&
+    !conn.disconnected.value,
+)
+
+// #697 fork 入口的渲染门：与回退共享能力门 / 投影权威门 / 忙碌三态，另与回退在途互斥
+//（rewindBusy 与 forkBusy 双向——两者同动 transcript，同时进行 = 网关侧乐观并发冲突）。
+const forkAvailable = computed(
+  () =>
+    conn.sessionControlAvailable.value &&
+    conn.transcriptSynced.value &&
+    !conn.rewindBusy.value &&
+    !conn.forkBusy.value &&
+    !streaming.value &&
+    !connecting.value &&
+    !conn.disconnected.value,
+)
+
+// #694 回退入口 emit（ChatStream→消息携带）：取网关条目 id 发起编排（无 id 时入口本就不渲染，防御性早退）。
+function rewind(msg: Msg): void {
+  if (!msg.entryId) return
+  void conn.rewind(msg.entryId)
+}
+
+// #697 fork 入口 emit：同 rewind 取 entryId 发起编排。
+function fork(msg: Msg): void {
+  if (!msg.entryId) return
+  void conn.fork(msg.entryId)
+}
+  
+// #698 分支菜单 busy 门（#706 词汇「会话控制能力」四合一套件同族）：忙碌态禁用而非隐藏——顶栏
+// 按钮闪现会推挤布局（与消息级入口的隐藏形态有意分歧）；transcriptSynced 关门（重连同步窗口内
+// 分支列表可能陈旧，fail-closed）。渲染门（length > 1）在 ChatHeader 哑组件内单点判定。
+const branchMenuBusy = computed(
+  () =>
+    conn.rewindBusy.value ||
+    conn.forkBusy.value ||
+    !conn.transcriptSynced.value ||
+    streaming.value ||
+    connecting.value ||
+    conn.disconnected.value,
+)
+
+// #698 分支切换 emit：无确认直接切换（#693 spec §1.4）
+function branchSwitch(leafEntryId: string): void {
+  void conn.switchBranch(leafEntryId)
+}
 
 // #405-T1：审批卡可见性过滤归 chatStore getter（#395 钉死 + #394 实测——当前会话是 subagent
 // 会话时审批区恒空；非 subagent 会话显示归属卡 + 无 sessionKey 连接级卡 + subagent 卡；
@@ -109,27 +180,17 @@ const executionStatus = computed(() => {
   return '已连接'
 })
 
-function draftOwner(): string {
-  try {
-    const part = auth.token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')
-    const payload = JSON.parse(atob(part.padEnd(Math.ceil(part.length / 4) * 4, '='))) as Record<string, unknown>
-    const identity = payload.sub ?? payload.username
-    if (typeof identity === 'string' && identity) return identity
-  } catch { /* malformed token falls through to token-scoped isolation */ }
-  return auth.token || 'signed-out'
-}
+// #668：JWT 身份解析与 localStorage 安全访问收敛到共享实现（stores/auth.tokenOwner /
+// storage.safeLocalStorage），面板三态宽度持久化共用同一套隔离语义。
 function draftKey(session = chat.selectedSession): string {
-  return `researcher:draft:${draftOwner()}:${chat.selectedContainer}:${session}`
-}
-function draftStorage(): Storage | null {
-  try { return globalThis.localStorage ?? null } catch { return null }
+  return `researcher:draft:${tokenOwner(auth.token)}:${chat.selectedContainer}:${session}`
 }
 watch(() => [chat.selectedContainer, chat.selectedSession] as const, () => {
-  if (chat.selectedContainer && chat.selectedSession) chat.setInput(draftStorage()?.getItem(draftKey()) ?? '')
+  if (chat.selectedContainer && chat.selectedSession) chat.setInput(safeLocalStorage()?.getItem(draftKey()) ?? '')
 })
 watch(() => chat.input, (value) => {
   if (!chat.selectedContainer || !chat.selectedSession) return
-  const storage = draftStorage(); if (!storage) return
+  const storage = safeLocalStorage(); if (!storage) return
   if (value) storage.setItem(draftKey(), value); else storage.removeItem(draftKey())
 })
 // #547 / ADR 0014：pending/resolving 请求固定在 composer 上方 ApprovalDock，避免被长回答顶出可视区域。
@@ -156,7 +217,7 @@ async function confirmRemoveSession(): Promise<boolean> {
 async function removeSession(key: string): Promise<void> {
   const res = await conn.removeSession(key, confirmRemoveSession)
   if (res === true) {
-    draftStorage()?.removeItem(draftKey(key))
+    safeLocalStorage()?.removeItem(draftKey(key))
     ElMessage.success('会话已删除')
   }
   else if (typeof res === 'string') ElMessage.error(res) // #461：失败 → 醒目错误 toast（替换顶部小字 bar）
@@ -174,6 +235,12 @@ function toggleApprovalDetail(a: { id: string }): void {
 const pendingAttachments = ref<PendingAttachment[]>([])
 let attachKey = 0
 
+// 预览条追加（单一入口）：采集三通道（粘贴/拖拽/选择）与 #694 回退回填共用同一落点——key 单调递增
+// （移除按钮按 key 定位）、图片经 toPreviewDataUrl 重建 dataURL 缩略。
+function pushAttachment(att: RawAttachment): void {
+  pendingAttachments.value.push({ key: ++attachKey, att, previewUrl: toPreviewDataUrl(att) })
+}
+
 // 三通道共用入口：粘贴/拖拽/文件选择的 File 列表 → 压缩（图片）/转换（非图片）→ 入预览条。
 // 不支持的类型（非 image/audio/video）即时提示，不入预览条（体积校验留发送前 buildAttachments 兜底）。
 async function addFiles(files: File[]): Promise<void> {
@@ -186,7 +253,7 @@ async function addFiles(files: File[]): Promise<void> {
       const att = file.type.startsWith('image/')
         ? await compressImageFile(file)
         : await fileToRawAttachment(file)
-      pendingAttachments.value.push({ key: ++attachKey, att, previewUrl: toPreviewDataUrl(att) })
+      pushAttachment(att)
     } catch {
       ElMessage.error(`附件读取失败：${file.name}`)
     }
@@ -216,6 +283,27 @@ async function regenerate(text: string): Promise<void> {
   chat.setInput(text)
   await nextTick()
   await sendMessage()
+}
+
+// #694 回退的草稿指纹（#693 spec §1.4）：文本 + 附件内容的水位线快照——composable 在 rewind RPC
+// 前后各取一次、比对是否变化（变化即跳过回填，保留用户新草稿）。附件是宿主局部态（不在 store），
+// 故指纹只能算在宿主侧；内容整体入指纹（不做长度摘要），保证「同长不同内容」也判为改动。
+function draftFingerprint(): string {
+  return JSON.stringify([
+    chat.input,
+    pendingAttachments.value.map((p) => [p.att.mimeType ?? '', p.att.fileName ?? '', p.att.content ?? '']),
+  ])
+}
+
+// #694 回退回填（指纹未变时才被 composable 调用；#697 fork 播种共用，改名 applyEntryBackfill——
+// 两路回填语义同构，不维护两份近似实现）：被剪/被点首条用户消息文本覆盖式写入草稿 + 网关返回的
+// 图片附件并入预览条（按内容去重——本地预览条已有同图时不重复插入，官方 merge 同款意图）。
+function applyEntryBackfill(text: string, attachments: RawAttachment[]): void {
+  chat.setInput(text)
+  for (const att of attachments) {
+    if (pendingAttachments.value.some((p) => p.att.mimeType === att.mimeType && p.att.content === att.content)) continue
+    pushAttachment(att)
+  }
 }
 
 async function loadInstances() {
@@ -271,6 +359,9 @@ defineExpose({
         :title="currentSessionTitle"
         :container="chat.selectedContainer"
         :connecting="connecting"
+        :branches="chat.branches"
+        :branch-busy="branchMenuBusy"
+        @branch-switch="branchSwitch"
       />
       <div v-if="connectionState" class="connection-banner" :class="connectionState.tone" role="status" aria-live="polite" :data-test="conn.disconnected.value ? 'reconnect-bar' : 'connection-banner'">
         <span class="connection-label">{{ connectionState.label }}</span>
@@ -282,8 +373,13 @@ defineExpose({
         :messages="chat.messages"
         :history-has-more="chat.historyHasMore"
         :history-loading="chat.historyLoading"
+        :rewind-available="rewindAvailable"
+        :fork-available="forkAvailable"
         @load-more="conn.loadMoreHistory"
         @regenerate="regenerate"
+        @toggle-trace-fold="chat.toggleTraceFold"
+        @rewind="rewind"
+        @fork="fork"
       >
         <!-- #461：无选中会话（含删除当前会话后）→ 空态视图 + 「新建会话」入口 -->
         <template #empty>
@@ -314,6 +410,8 @@ defineExpose({
         :connecting="connecting"
         :streaming="streaming"
         :disconnected="conn.disconnected.value"
+        :rewind-busy="conn.rewindBusy.value"
+        :fork-busy="conn.forkBusy.value"
         :pending-attachments="pendingAttachments"
         @input="conn.onComposerInput"
         @keydown="conn.onComposerKeydown"

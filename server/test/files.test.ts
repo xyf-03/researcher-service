@@ -82,6 +82,7 @@ class FakeFileArchive implements FileArchive {
 
   // #591 config 方法（files REST 不消费；仅满足 Port 契约——按容器名存 openclaw.json 文本）
   readonly configs = new Map<string, string>()
+  async seedWorkspace(): Promise<void> {} // files REST 不消费（编排 create 路径专用）
   async writeConfig(name: string, content: string): Promise<void> {
     this.configs.set(name, content)
   }

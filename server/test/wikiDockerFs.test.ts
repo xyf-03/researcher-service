@@ -46,6 +46,7 @@ class FakeArchive implements FileArchive {
     if (e) throw e
   }
   async writeConfig(): Promise<void> {}
+  async seedWorkspace(): Promise<void> {} // 本域不触达（编排 create 路径专用）
   async readConfig(): Promise<string> { return '' }
 }
 

@@ -6,7 +6,9 @@
 # + autofigure（AutoFigure sidecar，T08/T11：Python + Playwright chromium 构建期 + vendored 上游 +
 # 许可/署名文件；构建源 = deploy/autofigure-sidecar，**不 fetch mutable upstream**）
 # 四镜像，tag `:latest` + `:<CI head_sha>`（head_sha 取自通过的 CI run，使 latest/sha 精确对应该
-# commit，便于 :sha 回滚）。server 镜像构建期经 buildx 多 context 注入 home 模板（researcher 克隆）
+# commit，便于 :sha 回滚）。openclaw 派生镜像另推**版本 tag**（`:2026.9.4-browser` 形态，版本从
+# Dockerfile FROM 基线行单源提取，issue #695）——fleet 目标镜像钉的就是它（server config 默认值同版本）。
+# server 镜像构建期经 buildx 多 context 注入 home 模板（researcher 克隆）
 # 与 deploy/openclaw.json（ADR 0013：#593 模板入镜像，生产不再挂载任何宿主数据路径）；server 容器
 # 运行时经 OPENCLAW_IMAGE 默认值拉派生 openclaw 镜像。autofigure 镜像运行时经 compose
 # PANEL_AUTOFIGURE_IMAGE 默认值引用（T11）。AUTOFIGURE_LLM_KEY 为可选 secret（flag 关空串安全，
@@ -65,12 +67,51 @@ jobs:
           echo "IMAGE_REPO=${IMAGE_REPO}" >> "$GITHUB_ENV"
           echo "SERVER_IMAGE=ghcr.io/${IMAGE_REPO}/server" >> "$GITHUB_ENV"
           echo "FRONTEND_IMAGE=ghcr.io/${IMAGE_REPO}/frontend" >> "$GITHUB_ENV"
-          # openclaw 派生镜像（issue #588）：server config.ts OPENCLAW_IMAGE 默认值指向它的 :latest
+          # openclaw 派生镜像（issue #588）：server config.ts OPENCLAW_IMAGE 默认值指向它的版本 tag，
+          # standalone 模板栈 compose 默认值同钉该 tag（issue #695）。:latest 与 :<sha> 仍照推
+          # （:<sha> 供回滚；:latest 为滚动别名，fleet 与模板栈都不用）
           echo "OPENCLAW_IMAGE=ghcr.io/${IMAGE_REPO}/openclaw" >> "$GITHUB_ENV"
           # autofigure sidecar 镜像（T11）：compose PANEL_AUTOFIGURE_IMAGE 默认值指向它的 :latest
           echo "AUTOFIGURE_IMAGE=ghcr.io/${IMAGE_REPO}/autofigure" >> "$GITHUB_ENV"
 
-      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
+      - name: Resolve openclaw base version tag (Dockerfile FROM 单源, issue #695)
+        # 目标版本单源 = 派生 Dockerfile 的 FROM 基线行（issue #695）：控制面默认目标镜像
+        # （server/src/config.ts OPENCLAW_IMAGE 默认值）与模板栈 compose 默认值
+        # （deploy/docker-compose.yml）与之同版本（openclawImage.test.ts 交叉断言锁死运行期明文），
+        # CD 一并推该版本 tag——升级编排按版本 tag 判定目标、回滚仍走 :<sha>。
+        # 不引入第二配置源（build-arg / 常量）：版本的**提取源**只有 Dockerfile 一行。（bump 本身
+        # 不止改一行——还须同步 config 默认值 / 模板栈 compose / dev driver / 测试常量四处运行期明文，
+        # 见 deploy/README.md「派生镜像版本 tag 约定」，由 openclawImage.test.ts 交叉断言锁死。）
+        # 提取失败（缺 FROM 行 / 无 tag / digest 行 / 端口形态）即 fail：绝不推空 tag、sha 或含 '/' 的串当版本。
+        run: |
+          FROM_REF="$(grep -m1 -E '^[[:space:]]*FROM[[:space:]]' deploy/openclaw-image/Dockerfile | awk '{print $2}')"
+          # digest FROM 行（`…@sha256:…`）无版本可提取，且 sha 不可当版本 tag 推 → 显式拒。
+          case "$FROM_REF" in
+            *@*)
+              echo "[cd] ERROR: Dockerfile FROM 行为 digest 钉定，无法提取版本 tag（sha 不可作版本 tag）: '${FROM_REF}'" >&2
+              exit 1
+              ;;
+          esac
+          VERSION_TAG="${FROM_REF##*:}"
+          if [ -z "$FROM_REF" ] || [ -z "$VERSION_TAG" ] || [ "$VERSION_TAG" = "$FROM_REF" ]; then
+            echo "[cd] ERROR: 无法从 Dockerfile FROM 行提取版本 tag: '${FROM_REF}'" >&2
+            exit 1
+          fi
+          # 提取结果含 '/' ⇒ FROM 行形如「registry:5000/repo」（末段 `:` 是 registry 端口、非 tag）：
+          # tag 字符集不含 '/'，放行会在 push 处以 invalid reference 失败（诊断噪音），故与 digest 行
+          # 同族显式拒（imageTag 纯知识亦以「最后一段路径分量」认端口，两处行为一致）。**排在 no-tag
+          # 组之后**——无 tag 的引用（`VERSION_TAG == FROM_REF` 且含 `/`）先被上一组拦下，此处只判真正
+          # 的端口形态，避免错误信息指错原因。
+          case "$VERSION_TAG" in
+            */*)
+              echo "[cd] ERROR: 无法从 Dockerfile FROM 行提取版本 tag（末段 ':' 疑为 registry 端口）: '${FROM_REF}'" >&2
+              exit 1
+              ;;
+          esac
+          echo "OPENCLAW_VERSION_TAG=${VERSION_TAG}" >> "$GITHUB_ENV"
+          echo "[cd] openclaw 版本 tag: ${VERSION_TAG}"
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0
 
       - name: Log in to GHCR (push)
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
@@ -124,9 +165,13 @@ jobs:
           cache-to: type=gha,mode=max,scope=frontend
 
       - name: Build & push openclaw derived image (issue #588)
-        # 自建派生镜像：FROM 官方 2026.7.1-browser，叠加 pdftotext + wiki/workspace 骨架
+        # 自建派生镜像：FROM 官方 browser 基线（版本见 deploy/openclaw-image/Dockerfile FROM 行），
+        # 叠加 pdftotext + wiki/workspace 骨架
         # （ADR 0011/0013）。构建期断言在 Dockerfile RUN 内（pdftotext 可用 + 骨架齐全），
         # 任一失败即构建失败 → CD 红，不带病推送。
+        # 三个 tag（issue #695）：:latest + :<sha> + 版本 tag（版本从 Dockerfile FROM 基线行单源
+        # 提取，见上方 Resolve step）。**版本 tag 一经发布不可移动**——换内容 bump 版本，不覆盖同名。
+        # 注：tags 为字面块标量（逐行即一个 tag），块内不得写注释。
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
         with:
           context: deploy/openclaw-image
@@ -135,6 +180,7 @@ jobs:
           tags: |
             ${{ env.OPENCLAW_IMAGE }}:latest
             ${{ env.OPENCLAW_IMAGE }}:${{ env.IMAGE_TAG }}
+            ${{ env.OPENCLAW_IMAGE }}:${{ env.OPENCLAW_VERSION_TAG }}
           cache-from: type=gha,scope=openclaw
           cache-to: type=gha,mode=max,scope=openclaw
 
@@ -203,11 +249,12 @@ jobs:
           GHCR_PULL_USER: ${{ secrets.GHCR_PULL_USER }}
           GHCR_PULL_TOKEN: ${{ secrets.GHCR_PULL_TOKEN }}
           OPENCLAW_IMAGE: ${{ env.OPENCLAW_IMAGE }}
+          OPENCLAW_VERSION_TAG: ${{ env.OPENCLAW_VERSION_TAG }}
         with:
           host: ${{ secrets.REMOTE_HOST }}
           username: ${{ secrets.REMOTE_USER }}
           key: ${{ secrets.DEPLOY_KEY }}
-          envs: GHCR_PULL_USER,GHCR_PULL_TOKEN,OPENCLAW_IMAGE
+          envs: GHCR_PULL_USER,GHCR_PULL_TOKEN,OPENCLAW_IMAGE,OPENCLAW_VERSION_TAG
           script: |
             set -euo pipefail
 
@@ -224,12 +271,13 @@ jobs:
             # compose.yml/docker-compose.yml），缺 -f 会让 pull/up 报
             # "no configuration file provided: not found"。
             docker compose -f docker-compose.deploy.yml pull
-            # 运行时镜像验证 + 刷新 :latest 缓存（issue #588 派生镜像，私有 GHCR 包）：
+            # 运行时镜像验证 + 刷新目标镜像缓存（issue #588 派生镜像，私有 GHCR 包）：
             # ① server 容器经 dockerode 裸 pull（无 X-Registry-Auth）取 daemon 侧凭据——此步验证
             #    该路径可用（/api/health 绿但首次 create 401 的部署假绿即由此排除）；
-            # ② ensureImage 仅在本地缺失时拉取，:latest 被宿主缓存一次后 CD 新推送永远到不了
-            #    fleet——此步显式重拉，保证新容器跑到当前发布。
-            docker pull "${OPENCLAW_IMAGE}:latest"
+            # ② ensureImage 仅在本地缺失时拉取，镜像被宿主缓存一次后 CD 新推送永远到不了
+            #    fleet——此步显式重拉，保证新容器跑到当前发布。#695 起 fleet 目标 = 版本 tag
+            #    （非 :latest），故重拉的就是版本 tag（宿主缓存与目标同源）。
+            docker pull "${OPENCLAW_IMAGE}:${OPENCLAW_VERSION_TAG}"
             docker compose -f docker-compose.deploy.yml up -d --remove-orphans
             docker image prune -f
 

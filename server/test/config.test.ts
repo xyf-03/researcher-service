@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
 import { isQuotaValid, QUOTA_MAX } from '../src/auth/quota'
+import { isFloatingImageRef } from '../src/containers/imageRef'
 
 // 意见⑬[P2]（Codex 六轮）：DEFAULT_MAX_CONTAINERS 默认配额写入前未校验 —— config 加载时
 // Number(env ?? 3) 快照，非法 env（负/非数/超 Int 上界）会变 NaN/负数/超界，createUser/bootstrap
@@ -778,5 +779,107 @@ describe('AutoFigure sidecar url env (slice config, T07)', () => {
     expect(
       await loadAutofigureSidecarUrl({ env: 'production', flag: 'false', url: undefined }),
     ).toBe('')
+  })
+})
+
+// #695（spec §2.1，升级编排的版本前提）：OPENCLAW_IMAGE 目标镜像钉版 —— 生产环境目标为浮动引用
+// （无 tag 或 :latest）→ 启动 fail-fast。升级检测判定是「容器记录镜像 ≠ 当前目标」，浮动 tag 让
+// 目标定义随上游移动（升级不可复现 / 不可 review）；dev/test 容忍浮动（本地调试可覆盖回官方 :latest）。
+// 默认值版本与 deploy/openclaw-image/Dockerfile FROM 基线同版本——两处明文由
+// openclawImage.test.ts 交叉断言锁死（防双源漂移）。
+describe('fleet image pinning env (slice config, #695)', () => {
+  async function loadFleetImage(opts: {
+    env?: string
+    image?: string | undefined
+  }): Promise<string | 'THREW'> {
+    vi.resetModules() // 清 config 模块缓存，让动态 import 重新快照 env
+    const { env = 'production', image } = opts
+    vi.stubEnv('NODE_ENV', env)
+    if (env === 'production') {
+      // 隔离 fleet.image 变量：提供其余生产必填，否则放行用例被误判 THREW（同 loadPanelOrigin 模式）。
+      vi.stubEnv('JWT_SECRET', 's'.repeat(32))
+      vi.stubEnv('CREDENTIAL_ENCRYPTION_KEYS', Buffer.alloc(32, 0x01).toString('base64'))
+      vi.stubEnv('OPENCLAW_TEMPLATE_DIR', process.cwd())
+      vi.stubEnv('PANEL_PUBLIC_ORIGIN', 'https://panel.example.com')
+    }
+    if (image === undefined) delete process.env.OPENCLAW_IMAGE
+    else vi.stubEnv('OPENCLAW_IMAGE', image)
+    try {
+      const { config } = await import('../src/config')
+      return config.fleet.image
+    } catch (e) {
+      // fail-fast：错误消息须指向该 env（验收：生产浮动 tag → 启动期 fail-fast 含 env 名）
+      if (env === 'production') expect((e as Error).message).toContain('OPENCLAW_IMAGE')
+      return 'THREW'
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  }
+
+  it('生产缺省 → 默认派生镜像且非浮动（版本 tag 钉版）', async () => {
+    const v = await loadFleetImage({ image: undefined })
+    expect(v).not.toBe('THREW')
+    expect(v as string).toMatch(/^ghcr\.io\/acautomata\/researcher-service\/openclaw:/)
+    expect(isFloatingImageRef(v as string)).toBe(false)
+  })
+
+  it('生产 + 精确版本 tag → 放行', async () => {
+    const ref = 'ghcr.io/acautomata/researcher-service/openclaw:2026.9.4-browser'
+    expect(await loadFleetImage({ image: ref })).toBe(ref)
+  })
+
+  it('生产 + :latest → fail-fast（浮动 tag 随上游移动，目标不可复现）', async () => {
+    expect(
+      await loadFleetImage({ image: 'ghcr.io/acautomata/researcher-service/openclaw:latest' }),
+    ).toBe('THREW')
+  })
+
+  it('生产 + 无 tag（Docker 默认解析 :latest）→ fail-fast', async () => {
+    expect(await loadFleetImage({ image: 'ghcr.io/acautomata/researcher-service/openclaw' })).toBe(
+      'THREW',
+    )
+  })
+
+  it('生产 + 官方基线无 tag → fail-fast', async () => {
+    expect(await loadFleetImage({ image: 'ghcr.io/openclaw/openclaw' })).toBe('THREW')
+  })
+
+  it('生产 + digest 钉定（@sha256:…）→ 放行（digest 寻址不浮动）', async () => {
+    const ref = `ghcr.io/acautomata/researcher-service/openclaw@sha256:${'a'.repeat(64)}`
+    expect(await loadFleetImage({ image: ref })).toBe(ref)
+  })
+
+  it('registry 端口不误判为 tag：<host>:5000/openclaw 无 tag → fail-fast', async () => {
+    expect(await loadFleetImage({ image: 'registry.internal:5000/openclaw' })).toBe('THREW')
+  })
+
+  it('registry 端口 + 版本 tag → 放行（端口与 tag 各自解析）', async () => {
+    const ref = 'registry.internal:5000/openclaw:2026.9.4-browser'
+    expect(await loadFleetImage({ image: ref })).toBe(ref)
+  })
+
+  it('dev + :latest → 放行（本地调试不受影响）', async () => {
+    expect(
+      await loadFleetImage({ env: 'development', image: 'ghcr.io/openclaw/openclaw:latest' }),
+    ).toBe('ghcr.io/openclaw/openclaw:latest')
+  })
+
+  it('test + 无 tag → 放行（测试环境不受影响）', async () => {
+    expect(await loadFleetImage({ env: 'test', image: 'ghcr.io/openclaw/openclaw' })).toBe(
+      'ghcr.io/openclaw/openclaw',
+    )
+  })
+
+  // 纯准据（config 与 openclawImage.test.ts 静态断言共享同一判定语义）
+  it('isFloatingImageRef：无 tag / :latest 浮动；版本 tag / digest 不浮动', () => {
+    expect(isFloatingImageRef('ghcr.io/a/b/openclaw')).toBe(true)
+    expect(isFloatingImageRef('openclaw')).toBe(true)
+    expect(isFloatingImageRef('ghcr.io/a/b/openclaw:latest')).toBe(true)
+    expect(isFloatingImageRef('openclaw:latest')).toBe(true)
+    expect(isFloatingImageRef('openclaw:')).toBe(true) // 空 tag 不构成钉版
+    expect(isFloatingImageRef('ghcr.io/a/b/openclaw:2026.9.4-browser')).toBe(false)
+    expect(isFloatingImageRef('registry.internal:5000/openclaw:2026.9.4-browser')).toBe(false)
+    expect(isFloatingImageRef(`ghcr.io/a/b/openclaw@sha256:${'a'.repeat(64)}`)).toBe(false)
+    expect(isFloatingImageRef(`ghcr.io/a/b/openclaw:latest@sha256:${'a'.repeat(64)}`)).toBe(false)
   })
 })

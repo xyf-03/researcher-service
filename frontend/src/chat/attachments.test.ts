@@ -9,6 +9,8 @@ import {
   compressImageFile,
   fileToRawAttachment,
   fitWithin,
+  attachmentTypeOf,
+  editorAttachmentToRaw,
   isAllowedAttachmentType,
   MAX_ATTACHMENT_BYTES,
   MAX_IMAGE_EDGE,
@@ -28,7 +30,7 @@ function raw(overrides: Partial<RawAttachment> = {}): RawAttachment {
   }
 }
 
-describe('isAllowedAttachmentType（白名单 image/audio/video）', () => {
+describe('isAllowedAttachmentType（白名单 image/audio/video + 文档 mime）', () => {
   it('放行 image/audio/video 前缀', () => {
     expect(isAllowedAttachmentType('image/png')).toBe(true)
     expect(isAllowedAttachmentType('image/jpeg')).toBe(true)
@@ -37,12 +39,71 @@ describe('isAllowedAttachmentType（白名单 image/audio/video）', () => {
     expect(isAllowedAttachmentType('video/mp4')).toBe(true)
   })
 
-  it('拦截非白名单类型（文档等仅发送、渲染层不处理，但仍须挡大字节进帧）', () => {
-    expect(isAllowedAttachmentType('application/pdf')).toBe(false)
-    expect(isAllowedAttachmentType('text/plain')).toBe(false)
+  it('放行文档 mime（与 ChatMessageItem SAFE_DOCUMENT_MIMES 对齐 + text/markdown）', () => {
+    expect(isAllowedAttachmentType('application/pdf')).toBe(true)
+    expect(isAllowedAttachmentType('text/plain')).toBe(true)
+    expect(isAllowedAttachmentType('text/markdown')).toBe(true)
+    expect(isAllowedAttachmentType('text/csv')).toBe(true)
+    expect(isAllowedAttachmentType('application/json')).toBe(true)
+    expect(isAllowedAttachmentType('application/zip')).toBe(true)
+    expect(isAllowedAttachmentType('application/gzip')).toBe(true)
+    expect(isAllowedAttachmentType('application/x-tar')).toBe(true)
+  })
+
+  it('拦截白名单外类型（octet-stream 等未知二进制、office 渲染卡不认的 mime）', () => {
     expect(isAllowedAttachmentType('application/octet-stream')).toBe(false)
+    expect(isAllowedAttachmentType('application/msword')).toBe(false)
+    expect(isAllowedAttachmentType('image/svg+xml')).toBe(true) // image 前缀放行（发送侧不设防 mime，渲染侧 SAFE 排除 svg）
     expect(isAllowedAttachmentType('')).toBe(false)
     expect(isAllowedAttachmentType(undefined)).toBe(false)
+  })
+})
+
+describe('attachmentTypeOf（mime → 官方附件块类型）', () => {
+  it('image/audio/video 主段直映射', () => {
+    expect(attachmentTypeOf('image/png')).toBe('image')
+    expect(attachmentTypeOf('audio/mpeg')).toBe('audio')
+    expect(attachmentTypeOf('video/mp4')).toBe('video')
+  })
+
+  it('文档 mime → document（官方第 4 块类型，渲染下载卡）', () => {
+    expect(attachmentTypeOf('application/pdf')).toBe('document')
+    expect(attachmentTypeOf('text/plain')).toBe('document')
+    expect(attachmentTypeOf('text/markdown')).toBe('document')
+    expect(attachmentTypeOf('application/zip')).toBe('document')
+  })
+
+  it('白名单外 → null', () => {
+    expect(attachmentTypeOf('application/octet-stream')).toBeNull()
+    expect(attachmentTypeOf('')).toBeNull()
+    expect(attachmentTypeOf(undefined)).toBeNull()
+  })
+})
+
+// #694：回退 / 分叉响应 `editorAttachments` 元素（wire `{mimeType, data}`）→ RawAttachment。
+describe('editorAttachmentToRaw（网关修改类 RPC 的编辑器附件 → RawAttachment）', () => {
+  it('图片：type 派生 + content 原样纯 base64 + sizeBytes 按解码字节数反推（非 base64 长度）', () => {
+    expect(editorAttachmentToRaw({ mimeType: 'image/png', data: 'AAAA' })).toEqual({
+      type: 'image',
+      mimeType: 'image/png',
+      content: 'AAAA',
+      sizeBytes: 3, // 4 个字符 → 3 字节（padding 计）
+    })
+  })
+
+  it('白名单外 mime → null（调用方丢弃，不把渲染不出的块塞进预览条）', () => {
+    expect(editorAttachmentToRaw({ mimeType: 'application/octet-stream', data: 'AAAA' })).toBeNull()
+    expect(editorAttachmentToRaw({ mimeType: '', data: 'AAAA' })).toBeNull()
+  })
+
+  it('文档 mime → document（回填后仍能经发送校验，不被当未知类型拒发）', () => {
+    const att = editorAttachmentToRaw({ mimeType: 'application/pdf', data: 'AAAA' })
+    expect(att?.type).toBe('document')
+    expect(buildAttachments([att!]).rejected).toHaveLength(0)
+  })
+
+  it('空 data → sizeBytes 0（不臆造体积；下游按 0 字节放行）', () => {
+    expect(editorAttachmentToRaw({ mimeType: 'image/png', data: '' })).toMatchObject({ sizeBytes: 0 })
   })
 })
 
@@ -93,15 +154,17 @@ describe('buildAttachments（组装 chat.send attachments[]）', () => {
     expect(out.rejected).toEqual([])
   })
 
-  it('非白名单类型 → 拒发（不进 attachments，进 rejected）', () => {
+  it('白名单外类型 → 拒发（不进 attachments，进 rejected）；文档 mime 放行为 document', () => {
     const out = buildAttachments([
       raw({ fileName: 'ok.png' }),
-      raw({ mimeType: 'application/pdf', fileName: 'doc.pdf' }),
+      raw({ mimeType: 'application/pdf', fileName: 'doc.pdf', type: 'document' }),
+      raw({ mimeType: 'application/octet-stream', fileName: 'bin.dat' }),
     ])
-    expect(out.attachments).toHaveLength(1)
-    expect(out.attachments[0].fileName).toBe('ok.png')
+    expect(out.attachments).toHaveLength(2)
+    expect(out.attachments.map((a) => a.fileName)).toEqual(['ok.png', 'doc.pdf'])
+    expect(out.attachments[1].type).toBe('document')
     expect(out.rejected).toEqual([
-      expect.objectContaining({ fileName: 'doc.pdf', reason: 'type' }),
+      expect.objectContaining({ fileName: 'bin.dat', reason: 'type' }),
     ])
   })
 
@@ -124,12 +187,12 @@ describe('buildAttachments（组装 chat.send attachments[]）', () => {
   it('混合：合法 + 超类型 + 超体积 → 各归各位', () => {
     const out = buildAttachments([
       raw({ fileName: 'ok.png' }),
-      raw({ mimeType: 'application/pdf', fileName: 'doc.pdf' }),
+      raw({ mimeType: 'application/octet-stream', fileName: 'bin.dat' }),
       raw({ fileName: 'big.mp4', mimeType: 'video/mp4', content: 'x'.repeat(MAX_ATTACHMENT_BYTES + 1) }),
     ])
     expect(out.attachments.map((a) => a.fileName)).toEqual(['ok.png'])
     expect(out.rejected.map((r) => ({ name: r.fileName, reason: r.reason }))).toEqual([
-      { name: 'doc.pdf', reason: 'type' },
+      { name: 'bin.dat', reason: 'type' },
       { name: 'big.mp4', reason: 'size' },
     ])
   })
@@ -283,5 +346,26 @@ describe('fileToRawAttachment（非图片/通用文件 → RawAttachment）', ()
 
   it('type 从 mimeType 主段派生（image/audio/video）', async () => {
     expect((await fileToRawAttachment(new File(['a'], 's.mp3', { type: 'audio/mpeg' }))).type).toBe('audio')
+  })
+
+  it('文档 mime → type=document（官方第 4 块类型）', async () => {
+    const pdf = await fileToRawAttachment(new File(['a'], 'paper.pdf', { type: 'application/pdf' }))
+    expect(pdf.type).toBe('document')
+    expect(pdf.mimeType).toBe('application/pdf')
+  })
+
+  it('浏览器无注册 mime 的文件（如 .md，File.type 为空串）→ 按扩展名派生 mime', async () => {
+    const md = await fileToRawAttachment(new File(['# 标题'], 'NOTES.md', { type: '' }))
+    expect(md.mimeType).toBe('text/markdown')
+    expect(md.type).toBe('document')
+    const txt = await fileToRawAttachment(new File(['hi'], 'a.txt', { type: '' }))
+    expect(txt.mimeType).toBe('text/plain')
+    expect(txt.type).toBe('document')
+  })
+
+  it('无 mime 且扩展名不可识别 → mimeType 空 → 白名单拒（下游 buildAttachments 拦）', async () => {
+    const bin = await fileToRawAttachment(new File([new Uint8Array([1])], 'x.weird', { type: '' }))
+    expect(bin.mimeType).toBe('')
+    expect(isAllowedAttachmentType(bin.mimeType)).toBe(false)
   })
 })

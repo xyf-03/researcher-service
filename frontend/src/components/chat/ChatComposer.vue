@@ -21,6 +21,13 @@ const props = withDefaults(
     connecting: boolean
     streaming: boolean
     disconnected: boolean
+    // Codex #703 P1（F2）：回退在途——窗口内投影还是回退前的旧代，发送会被随后的 abandonActiveRun
+    // 吞掉（用户消息与回复双双丢失），故发送键置灰。输入框/附件编辑不受限（草稿指纹守卫允许窗口内
+    // 继续编辑，回填时新草稿原地保留）。
+    rewindBusy?: boolean
+    // #697：fork 在途——同 rewindBusy 语义（导航窗口内 send 会被切换冲掉），发送键置灰；
+    // 输入框/附件编辑不受限。
+    forkBusy?: boolean
     pendingAttachments?: PendingAttachment[]
   }>(),
   { pendingAttachments: () => [] },
@@ -153,8 +160,8 @@ watch(() => props.modelValue, () => void nextTick(resize), { immediate: true })
       ></textarea>
       <button
         data-test="send"
-        :disabled="connecting || streaming || disconnected"
-        :title="connecting ? '正在连接' : streaming ? '正在生成回答' : disconnected ? '连接已断开' : '发送消息'"
+        :disabled="connecting || streaming || disconnected || rewindBusy || forkBusy"
+        :title="connecting ? '正在连接' : streaming ? '正在生成回答' : disconnected ? '连接已断开' : rewindBusy ? '正在回退' : forkBusy ? '正在分叉' : '发送消息'"
         aria-label="发送消息"
         @click="emit('send')"
       >发送</button>

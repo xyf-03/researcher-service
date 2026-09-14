@@ -272,6 +272,13 @@ export class FleetCommand {
           // → putArchive 写容器内 ~/.openclaw/openclaw.json → start——首启 gateway 即读渲染配置，
           // 无需重启；config 零宿主路径（named volume / bind home 内）。
           const containerId = await this.deps.runtime.create(spec)
+          // #6xx named volume 拓扑：provision 的宿主树不进容器（卷首挂由镜像骨架初始化），
+          // 模板 workspace（researcher 各项 md + skills）经 putArchive 灌卷补上——create 后
+          // start 前（同 writeConfig 时序，putArchive 对 created 容器可用），首启 agent 即见
+          // 完整 workspace。旧 bind 模式 provision 已宿主预填充 home，不重复灌。
+          if (spec.volumes !== undefined) {
+            await this.deps.archive.seedWorkspace(name, path.join(this.deps.config.templateDir, 'workspace'))
+          }
           await this.deps.archive.writeConfig(inst.name, rendered)
           // 按 id 启动（#591）：create 返回的 id 精确指向本代容器——按 name 启动在外部 actor
           // 删/重建同名容器的窗口会错启他人容器
