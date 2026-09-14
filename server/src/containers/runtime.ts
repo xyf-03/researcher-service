@@ -2,7 +2,7 @@
 // 业务层只依赖本接口（ContainerRuntime），docker 接触面在 DockerRuntime（dockerode），
 // 测试注入 FakeRuntime（接缝 #5 编排器 Port）。
 
-import { CONTAINER_PREFIX, VOLUME_HOME_PREFIX, VOLUME_WIKI_PREFIX, VOLUME_WORKSPACE_PREFIX } from './constants'
+import { CONTAINER_PREFIX, VOLUME_HOME_PREFIX, VOLUME_HOME_BACKUP_PREFIX, VOLUME_WIKI_PREFIX, VOLUME_WORKSPACE_PREFIX } from './constants'
 
 // 实例名 → docker 容器名（openclaw-gw-<name>）
 export function containerName(name: string): string {
@@ -31,6 +31,12 @@ export function namedVolumesFor(instanceId: string): NamedVolumes {
 // 测试断言同源，防四处手写顺序漂移）
 export function volumeOrder(v: NamedVolumes): [string, string, string] {
   return [v.wiki, v.workspace, v.home]
+}
+
+// #699 升级备份卷名（openclaw-home-backup-<instanceId>）：独立于代系三卷命名——不在
+// namedVolumesFor / volumeOrder（删除连删）范围，删容器后备份仍留存供手工救回（spec §2.4）。
+export function backupVolumeFor(instanceId: string): string {
+  return `${VOLUME_HOME_BACKUP_PREFIX}${instanceId}`
 }
 
 // 创建一个容器所需的语义参数（orchestrator → runtime）
@@ -90,6 +96,9 @@ export interface OneShotResult {
 
 // 容器运行时接触面（docker daemon 原语）。DockerRuntime 与 FakeRuntime 结构满足本接口。
 export interface ContainerRuntime {
+  // 确保镜像已本地就位（缺失则 pull；#699 升级编排步骤 1 显式调用——先拉后停，拉失败=干净中止。
+  // DockerRuntime 早已内置于 create/runOnce 前置；升级需要「显式先拉」把慢 pull 排在停机之前）
+  ensureImage(image: string): Promise<void>
   // 创建并启动一个容器，返回 docker container id
   run(spec: ContainerSpec): Promise<string>
   // 只创建容器（不启动），返回 docker container id（#591：createComplete 先 create → 经

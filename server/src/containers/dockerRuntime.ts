@@ -195,12 +195,13 @@ export class DockerRuntime implements ContainerRuntime {
     return container.id
   }
 
-  // create 前确保镜像已就位（Codex 第四轮③[P1]）：Engine createContainer 对本地缺失的镜像返回
-  // image-not-found——干净 host / OPENCLAW_IMAGE 换成未缓存 tag 时 create 必 error。CI 此前靠手动
+  // create/runOnce 前置确保镜像已就位（Codex 第四轮③[P1]）：Engine createContainer 对本地缺失的镜像
+  // 返回 image-not-found——干净 host / OPENCLAW_IMAGE 换成未缓存 tag 时 create 必 error。CI 此前靠手动
   // docker pull 掩盖。这里仅本地缺失时拉取（getImage().inspect() 404 → 拉；已缓存 → 跳过，避免
   // 每次 create 都重复 pull）。pull 经 modem.followProgress 消费进度流（不消费则流不 flowing、
   // pull 永不完成）。拉取失败向上抛 → createComplete 标 error 行（可重试）。
-  private async ensureImage(image: string): Promise<void> {
+  // #699 升级编排步骤 1 显式调用：把慢 pull 排在停机之前，失败=干净中止（原私有助手提为接口方法）。
+  async ensureImage(image: string): Promise<void> {
     try {
       await this.client().getImage(image).inspect()
       return

@@ -43,11 +43,17 @@ export class FakeRuntime implements ContainerRuntime {
   failExecSyncFor = new Set<string>()
   // execSync 调用记录（断言 delete 的 chown / approve 的 CLI argv）。
   execCalls: { name: string; cmd: string[] }[] = []
+  // #699 ensureImage（升级步骤 1 拉镜像）：调用记录 + 故障注入（拉失败 = 干净中止、不计失败）。
+  readonly ensureImageCalls: string[] = []
+  failEnsureImageFor = new Set<string>()
   // #696 一次性临时容器：调用记录 + 故障注入（退出码/输出/等待退出抛错）。
   readonly oneshotRuns: FakeOneShotRecord[] = []
   oneshotExitCode = 0
   oneshotOutput = ''
   oneshotWaitError: Error | null = null
+  // #699 按命令子串定向 fail runOnce（升级测试：备份 vs doctor 失败分流）。命中时按当前
+  // oneshotExitCode 抛 RunOnceError——不整段替换 oneshotExitCode（保三路清理断言共享）。
+  failOneshotCmdSubstring: string | null = null
   // #590：remove 收到 volumes 时的卷删除记录（断言 named volume 模式连带 docker volume rm 三卷）。
   removedVolumes: string[] = []
 
@@ -109,6 +115,14 @@ export class FakeRuntime implements ContainerRuntime {
     return s
   }
 
+  // #699 升级编排步骤 1：记录调用 + 按需注入拉取失败（干净中止路径）。
+  async ensureImage(image: string): Promise<void> {
+    this.ensureImageCalls.push(image)
+    if (this.failEnsureImageFor.has(image)) {
+      throw new Error(`simulated image pull failure for ${image}`)
+    }
+  }
+
   async get(name: string): Promise<ContainerInfo | null> {
     if (this.failGetFor.has(name)) throw new Error(`simulated daemon unreachable for ${name}`)
     return this.containers.get(name)?.info ?? null
@@ -159,6 +173,10 @@ export class FakeRuntime implements ContainerRuntime {
     this.oneshotRuns.push(rec)
     try {
       if (this.oneshotWaitError) throw this.oneshotWaitError
+      // #699 按命令子串定向失败（备份 vs doctor 分流断言）：命中 → 按当前注入退出码抛错。
+      if (this.failOneshotCmdSubstring && spec.cmd.join(' ').includes(this.failOneshotCmdSubstring)) {
+        throw new RunOnceError(rec.exitCode !== 0 ? rec.exitCode : 9, rec.output, spec.cmd)
+      }
       if (rec.exitCode !== 0) throw new RunOnceError(rec.exitCode, rec.output, spec.cmd)
       return { output: rec.output }
     } finally {

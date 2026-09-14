@@ -11,6 +11,15 @@ export const CONTAINER_PREFIX = 'openclaw-gw-'
 export const VOLUME_WIKI_PREFIX = 'openclaw-wiki-'
 export const VOLUME_WORKSPACE_PREFIX = 'openclaw-workspace-'
 export const VOLUME_HOME_PREFIX = 'openclaw-home-'
+// #699 升级备份卷名前缀：openclaw-home-backup-<instanceId>——独立于代系三卷命名（runtime.backupVolumeFor），
+// 不在 namedVolumesFor / 删除连删范围：删容器后备份仍在，供故障手工救回（spec §2.4）。
+export const VOLUME_HOME_BACKUP_PREFIX = 'openclaw-home-backup-'
+// 备份卷在一次性临时容器内的挂载点 + 备份 tar 文件名（#699 备份 runOnce 单一来源；手工救回按
+// `tar tzf /b/home.tar.gz` 读出——冒烟清单同形状）。
+export const ONESHOT_BACKUP_TARGET = '/backup'
+export const BACKUP_TAR_NAME = 'home.tar.gz'
+// #699 升级连续失败进入终态（upgrade_failed）的阈值（spec §2.2：可重试失败 +1、成功清零、≥3 终态）。
+export const UPGRADE_MAX_ATTEMPTS = 3
 // 按 label 过滤管理容器生命周期
 export const LABEL_APP_KEY = 'app'
 export const LABEL_APP_VALUE = 'openclaw-fleet'
