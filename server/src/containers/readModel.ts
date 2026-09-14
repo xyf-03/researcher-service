@@ -11,6 +11,7 @@ import {
   HEALTH_STOPPED,
   HEALTH_UNHEALTHY,
 } from './values'
+import { UPGRADE_MAX_ATTEMPTS } from './constants'
 import type { FleetDeps } from './deps'
 
 // 有界并发 map（Codex 第五轮④[P2]）：admin 大 fleet 下 Promise.all 每个容器并发一次 docker inspect +
@@ -37,6 +38,7 @@ async function mapWithConcurrency<T, R>(
 }
 
 // ContainerSummary（契约 §2.3）：{name, port, status, health, image, container_id, created_at}
+// #699 增加 needs_upgrade：判定式 = 容器记录镜像 ≠ 当前目标镜像（config.fleet.image），schema 零改动。
 export interface ContainerSummary {
   name: string
   port: number
@@ -45,6 +47,7 @@ export interface ContainerSummary {
   image: string
   container_id: string
   created_at: Date
+  needs_upgrade: boolean
 }
 
 export class FleetReadModel {
@@ -67,6 +70,9 @@ export class FleetReadModel {
       image: inst.image,
       container_id: inst.containerId,
       created_at: inst.createdAt,
+      // #699 升级检测（spec §2.1）：容器记录镜像 ≠ 当前目标镜像 → 需升级。方向无关（降级拒绝下沉
+      // 编排层 upgradeReserve）；升级成功记回 target 后自然转 false。
+      needs_upgrade: inst.image !== this.deps.config.image,
     }
   }
 
@@ -75,6 +81,10 @@ export class FleetReadModel {
     if (inst.status === 'creating') return this.item(inst, 'creating', HEALTH_PENDING)
     if (inst.status === 'removing') return this.item(inst, 'removing', HEALTH_REMOVING)
     if (inst.status === 'error') return this.item(inst, 'error', HEALTH_STOPPED)
+    // #699 升级状态瞬态透传（spec §2.2）：upgrading 同 creating 不探健康（升级在飞、容器可能停机）；
+    // upgrade_failed 终态 health 显示 stopped（容器已停/不可用，仅可删除重建）。
+    if (inst.status === 'upgrading') return this.item(inst, 'upgrading', HEALTH_PENDING)
+    if (inst.status === 'upgrade_failed') return this.item(inst, 'upgrade_failed', HEALTH_STOPPED)
     // runtime.get 可能因 daemon 不可用抛异常——单项抖动降级透传，不隐藏其它正常容器。
     // fallback 保留 DB 记账状态（Codex 第四轮⑤[P2]）：修前硬编码 status:'running'，把「已对账/存储
     // 为 stopped」的行在 daemon 故障期间返回成 running+health:stopped 矛盾组合，客户端误判为活动。
@@ -127,6 +137,51 @@ export class FleetReadModel {
         if (next.containerId) inst.containerId = next.containerId
       } catch {
         // 落盘失败不阻断本次出参（内存对象已收敛，下次 list 再对账）
+      }
+    }
+  }
+
+  // #699 升级行对账（spec §2.5）：服务重启后卡「升级中」的行在 list 路径收敛（镜像 reconcileCreating 的
+  // lazy-repair）。活动升级判定经进程内 lock.isHeld——本进程升级在飞 → 跳过。
+  // - owned 容器 running → running（image 补记 runtime 实况：升级已完成的新镜像在跑 → 记 target；
+  //   崩在拉镜像前的旧镜像在跑 → 保持旧 image，needsUpgrade 仍为 true——按实况记录保证一致性）。
+  // - 否则（容器已停/消失）→ stopped + 计 1 次失败 attempt（≥3 → upgrade_failed 终态，仅可删除）。
+  // - daemon 不可达 → 保持 upgrading，下次 list 再对账。
+  private async reconcileUpgrading(insts: Container[]): Promise<void> {
+    for (const inst of insts) {
+      if (inst.status !== 'upgrading') continue
+      if (this.deps.lock.isHeld(inst.name)) continue
+      let info
+      try {
+        info = await this.deps.runtime.get(inst.name)
+      } catch {
+        // daemon 临时不可用 → 逐行降级（保持 upgrading，下次 list 再对账）。
+        continue
+      }
+      if (info && info.running && info.instanceName === inst.name) {
+        const next: { status: Container['status']; image?: string; containerId?: string } = { status: 'running' }
+        if (info.image) next.image = info.image
+        if (info.containerId) next.containerId = info.containerId
+        try {
+          await this.prisma.container.update({ where: { id: inst.id }, data: next })
+          inst.status = 'running'
+          if (next.image) inst.image = next.image
+          if (next.containerId) inst.containerId = next.containerId
+        } catch {
+          // 落盘失败不阻断本次出参（内存对象已收敛，下次 list 再对账）
+        }
+      } else {
+        const attempts = inst.upgradeAttempts + 1
+        const status: Container['status'] = attempts >= UPGRADE_MAX_ATTEMPTS ? 'upgrade_failed' : 'stopped'
+        try {
+          await this.prisma.container.update({
+            where: { id: inst.id },
+            data: { status, upgradeAttempts: attempts },
+          })
+          inst.status = status
+        } catch {
+          // 落盘失败不阻断本次出参（内存对象已收敛，下次 list 再对账）
+        }
       }
     }
   }
@@ -185,6 +240,7 @@ export class FleetReadModel {
     })
     if (insts.length === 0) return { items: [], ids: new Map() }
     await this.reconcileCreating(insts)
+    await this.reconcileUpgrading(insts)
     const survivors = await this.reconcileRemoving(insts)
     // 并发健康探测（有界 worker 池，bound 总延迟而非 N×timeout 串行、亦不无界并发）。
     return {
