@@ -92,7 +92,7 @@ function setup(opts: { withoutActionError?: boolean } = {}): { status: ChatStatu
     onError: vi.fn(),
     onClearError: vi.fn(),
     // #694 动作类失败通道（宿主注入；ChatView 接 ElMessage）。withoutActionError 用于验证缺省回退 onError。
-    ...(opts.withoutActionError ? {} : { onActionError: vi.fn() }),
+    ...(opts.withoutActionError ? {} : { onActionError: vi.fn<(message: string) => void>() }),
     // #694 回退编排的 composer 协同（宿主注入）：缺省「草稿全程未变」→ 回填恒执行；指纹/回填
     // 断言由各用例覆盖（改写 mockReturnValueOnce/mock.calls）。
     onRewindDraftFingerprint: vi.fn(() => 'draft-stable'),
