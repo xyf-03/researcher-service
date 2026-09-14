@@ -124,6 +124,23 @@ export function createContainersRouter(orch: Orchestrator, runtime: ContainerRun
     ok(res, { status: 'removing' })
   })
 
+  // POST /<name>/upgrade —— #699 容器升级编排（spec §2.3，异步信封，对齐 POST/DELETE 先例）。
+  // 归属前置：owner 本人或 admin（普通用户可升级自己的容器，#687 决策，无需管理员介入）。
+  // 同步段：守卫/幂等/置 upgrading，返回「升级中」快照；后台六步编排 detach（异步信封）。
+  // 幂等/守卫语义在 upgradeReserve 内（已 upgrading → 同快照；upgrade_failed/creating/removing →
+  // 20043；镜像已对齐 → 200 no-op；bind 模式 → 20043「请删重建」）。
+  router.post('/:name/upgrade', async (req: Request, res: Response) => {
+    const name = req.params.name as string
+    assertValidContainerName(name)
+    await getInstanceForUser(req.prisma, req.user!, name)
+    const { inst, triggered } = await orch.upgradeReserve(name)
+    // detach 后台六步编排（对齐 POST provisioning / DELETE 清理）：同步段立即返「升级中」快照，
+    // 不等 docker pull/备份/doctor/recreate 完成；后台失败已由 runUpgrade 收敛行状态，
+    // catch 防 unhandled rejection，客户端经 list 轮询感知。
+    if (triggered) void orch.submitUpgrade(name).catch(() => {})
+    ok(res, { ...orch.createdItem(inst) })
+  })
+
   // POST /<name>/bootstrap-token —— ADR 0006 D1（#369 接线前置）：所有权门控发放容器 bootstrap token。
   // 协议机首连须 bootstrap auth（ADR 事实 2：无 token 首连在配对前即失败）；token 真值只下发属主浏览器
   // （bootstrap 后可经网关配对换 deviceToken，真值仍不落前端以外的盘/日志）。

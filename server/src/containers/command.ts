@@ -13,11 +13,20 @@ import { randomBytes, randomUUID } from 'node:crypto'
 import { access, mkdir, readFile } from 'node:fs/promises'
 import path from 'node:path'
 import type { PrismaClient, Container } from '../generated/prisma/client'
-import { TOKEN_URLSAFE_BYTES, HOME_BIND } from './constants'
+import {
+  BACKUP_TAR_NAME,
+  HOME_BIND,
+  MOUNT_WIKI,
+  MOUNT_WORKSPACE,
+  ONESHOT_BACKUP_TARGET,
+  TOKEN_URLSAFE_BYTES,
+  UPGRADE_MAX_ATTEMPTS,
+} from './constants'
 import { CODE } from '../codes'
 import { fail } from '../envelope'
 import {
   ConfigurationError,
+  ContainerDomainError,
   InstanceBusy,
   InstanceCleanupError,
   InstanceExists,
@@ -27,10 +36,12 @@ import {
 } from './errors'
 import type { FleetDeps } from './deps'
 import {
+  backupVolumeFor,
   namedVolumesFor,
   type ContainerInfo,
   type ContainerSpec,
   type NamedVolumes,
+  type OneShotSpec,
 } from './runtime'
 import { ConfigRenderer } from './configRenderer'
 
@@ -47,6 +58,39 @@ async function pathExists(p: string): Promise<boolean> {
     return true
   } catch {
     return false
+  }
+}
+
+// ---- #699 升级步骤命令构建（单一来源；测试经 FakeRuntime.oneshotRuns 断言 OneShotSpec 形状）----
+
+// 备份（硬性首步，任何卷变更之前，spec §2.4 步骤 3）：目标镜像临时容器挂 home 卷（只读）+ 备份卷，
+// home 卷全量 tar 进备份卷。home 只读——备份不得改写源卷；备份卷独立于代系三卷（runtime.backupVolumeFor，
+// 删容器不清除，供故障手工救回）。
+export function buildBackupOneShot(target: string, homeVolume: string, backupVolume: string): OneShotSpec {
+  return {
+    image: target,
+    cmd: ['sh', '-c', `tar czf ${ONESHOT_BACKUP_TARGET}/${BACKUP_TAR_NAME} -C ${HOME_BIND} .`],
+    mounts: [
+      { source: homeVolume, target: HOME_BIND, readOnly: true },
+      { source: backupVolume, target: ONESHOT_BACKUP_TARGET },
+    ],
+  }
+}
+
+// doctor（legacy session 迁移——9.4 网关遇 legacy store 拒 ready，spec §2.4 步骤 4）：临时容器挂与
+// 真容器同布局三卷 + 目标镜像，跑 `openclaw doctor --fix`。env 须与真容器同环境（卷内 openclaw.json
+// 的 ${GATEWAY_TOKEN} 占位由进程运行时插值——doctor 拿不到同 env 就读不了配置）。用临时容器而非 exec：
+// 9.4 遇 legacy store 拒绝就绪（先起真容器再 exec 不可行）、stopped 容器亦不可 exec（#683 事实 3）。
+export function buildDoctorOneShot(target: string, volumes: NamedVolumes, env: Record<string, string>): OneShotSpec {
+  return {
+    image: target,
+    cmd: ['openclaw', 'doctor', '--fix'],
+    mounts: [
+      { source: volumes.wiki, target: MOUNT_WIKI },
+      { source: volumes.workspace, target: MOUNT_WORKSPACE },
+      { source: volumes.home, target: HOME_BIND },
+    ],
+    env,
   }
 }
 
@@ -504,6 +548,11 @@ export class FleetCommand {
     const inst = await this.prisma.container.findUnique({ where: { name } })
     // 不应到达（路由层归属前置已 20040）；防御分支沿用同码（20040 = 不存在），非 20043 busy。
     if (!inst) throw fail(CODE.CONTAINER_NOT_FOUND)
+    // #699 升级守卫（spec §2.3）：目标 upgrading → 拒删 20043（升级在飞，删除会把容器切一半）；
+    // upgrade_failed 终态放行删除（既有清理路径；备份卷除外——备份卷独立于删除连删范围）。
+    if (inst.status === 'upgrading') {
+      throw new ContainerDomainError(CODE.CONTAINER_BUSY, `容器升级中，禁止删除: ${name}`)
+    }
     // 在飞 create：置取消标志（provisioning 检查点检出即统一回滚），不干等。
     this.cancel.flag(name)
     // 标 removing（终态前奏），list 轮询可见。
@@ -599,6 +648,183 @@ export class FleetCommand {
     await this.prisma.container.delete({ where: { id: inst.id } })
     this.cancel.clear(name)
     return 'removed'
+  }
+
+  // ---- #699 容器升级编排（spec §2：六步序 + 干净中止 + attempts 守卫）----
+
+  // 同步段：守卫 + 幂等 + 置 upgrading + 拿 name lease（与 create/delete 同名互斥）。
+  // 返回 triggered=false = 幂等 no-op（未启动后台）；true = 已置 upgrading、路由应 submitUpgrade。
+  async upgradeReserve(name: string): Promise<{ inst: Container; triggered: boolean }> {
+    const inst = await this.prisma.container.findUnique({ where: { name } })
+    // 不应到达（路由层归属前置已 20040）；防御分支沿用同码（20040 = 不存在）。
+    if (!inst) throw fail(CODE.CONTAINER_NOT_FOUND)
+    // bind 模式（named volumes 关闭）无升级编排路径（spec §2.4 末：直接拒绝，文案「请删重建」）。
+    if (!this.deps.config.namedVolumes) {
+      throw new ContainerDomainError(CODE.CONTAINER_BUSY, `named volume 拓扑未开启（OPENCLAW_NAMED_VOLUMES=false），升级请删重建: ${name}`)
+    }
+    // 幂等：已 upgrading → 200 返当前快照，不重复入队（spec §2.3）。
+    if (inst.status === 'upgrading') return { inst, triggered: false }
+    // 终态：upgrade_failed → 20043 变体文案「仅可删除重建」（spec §2.3）。
+    if (inst.status === 'upgrade_failed') {
+      throw new ContainerDomainError(CODE.CONTAINER_BUSY, `容器升级失败，仅可删除重建: ${name}`)
+    }
+    // busy：仅 running/stopped 可触发（creating/removing/error → 20043）。
+    if (inst.status !== 'running' && inst.status !== 'stopped') throw new InstanceBusy(name)
+    // 幂等 no-op：容器记录镜像已对齐当前目标 → 无需升级（spec §2.1/§2.3）。
+    if (inst.image === this.deps.config.image) return { inst, triggered: false }
+    // 与 create/delete 同名互斥：拿 name lease（在飞 create/upgrade → 20043 busy；deleteReserve 对
+    // upgrading 已拒删，故无在飞 delete）。
+    const lease = this.deps.lock.tryAcquire(name)
+    if (lease === null) throw new InstanceBusy(name)
+    this.leases.set(name, lease)
+    try {
+      const updated = await this.prisma.container.update({
+        where: { id: inst.id },
+        data: { status: 'upgrading' },
+      })
+      return { inst: updated, triggered: true }
+    } catch (e) {
+      this.releaseLease(name)
+      throw e
+    }
+  }
+
+  // 后台入口：按 name 串行 + 队列并发（对齐 submitCreate/submitDelete）。完成时 settle（供测试 await）。
+  submitUpgrade(name: string): Promise<void> {
+    return this.deps.serializer.enqueue(name, async () => {
+      try {
+        await this.deps.queue.submit(() => this.runUpgrade(name))
+      } catch (e) {
+        // 队列不可达补偿（对齐 submitCreate）：runUpgrade 的 finally 不会执行 → lease 永久持有 + 行卡
+        // upgrading。释放 lease（reconcileUpgrading 在下次 list 按 runtime 实况收敛该行）。
+        this.releaseLease(name)
+        throw e
+      }
+    })
+  }
+
+  // 后台六步编排；domain 失败全部内部收敛（干净中止 / attempts），兜底异常按可重试失败收敛、不再上抛。
+  private async runUpgrade(name: string): Promise<void> {
+    try {
+      const inst = await this.prisma.container.findUnique({ where: { name } })
+      // 行已删/状态已变（极端竞态）→ 直接退（不误收敛他人状态）。
+      if (!inst || inst.status !== 'upgrading') return
+      await this.upgrade0(inst)
+    } catch (e) {
+      // 兜底：未捕获异常 → 按可重试失败收敛 + 尽力复启旧容器（日志如实记录）。
+      const inst = await this.prisma.container.findUnique({ where: { name } }).catch(() => null)
+      if (inst) await this.failUpgradeAttempt(inst, 'unexpected upgrade error', e)
+      // eslint-disable-next-line no-console
+      console.error(`[fleet] background upgrade failed for ${name}`, e)
+    } finally {
+      this.releaseLease(name)
+    }
+  }
+
+  // 六步序（spec §2.4）：
+  //   1 拉目标镜像（先做不停机）        → 失败 = 干净中止（不计失败）
+  //   2 stop（幂等）
+  //   3 备份 home 卷（硬性首步）        → 失败 = 干净中止（不计失败）
+  //   4 openclaw doctor --fix（三卷同布局）→ 失败 = 失败 attempt（attempts+1）
+  //   5 保留三卷 recreate（不 provision/seedWorkspace/writeConfig）→ 失败 = 失败 attempt
+  //   6 记回 image=target + running + attempts 清零（needsUpgrade 自然转 false）
+  private async upgrade0(inst: Container): Promise<void> {
+    const target = this.deps.config.image
+    const volumes = namedVolumesFor(inst.id)
+    const token = inst.tokenEncrypted ? this.deps.crypto.decrypt(inst.token) : inst.token
+
+    // 步骤 1：拉目标镜像（可慢，先做不停机——慢 pull 排在任何卷变更之前）。
+    try {
+      await this.deps.runtime.ensureImage(target)
+    } catch (e) {
+      await this.abortClean(inst, 'pull target image', e)
+      return
+    }
+
+    // 步骤 2：停容器（幂等）。
+    await this.deps.runtime.stop(inst.name)
+
+    // 步骤 3：备份 home 卷（硬性首步，任何卷变更之前）。失败 → 干净中止（数据未动，旧容器复启照常）。
+    try {
+      await this.deps.runtime.runOnce(buildBackupOneShot(target, volumes.home, backupVolumeFor(inst.id)))
+    } catch (e) {
+      await this.abortClean(inst, 'backup home volume', e)
+      return
+    }
+
+    // 步骤 4：doctor --fix（legacy session 迁移前置；失败 = 失败 attempt）。
+    try {
+      await this.deps.runtime.runOnce(
+        buildDoctorOneShot(target, volumes, {
+          GATEWAY_TOKEN: token,
+          OPENCLAW_GATEWAY_TOKEN: token,
+          LLM_API_KEY: this.deps.config.llmApiKey,
+        }),
+      )
+    } catch (e) {
+      await this.failUpgradeAttempt(inst, 'openclaw doctor --fix', e)
+      return
+    }
+
+    // 步骤 5：保留三卷 recreate（spec §2.4）——remove 不带 volumes（三卷保留，与删除路径的唯一本质
+    // 差异，防串读设计关系 #687）；create 不 provision / 不 seedWorkspace / 不 writeConfig（卷内已有
+    // 用户数据与用户级 model provider config，覆写即毁）。
+    try {
+      await this.deps.runtime.remove(inst.name)
+      const spec: ContainerSpec = {
+        name: inst.name,
+        image: target,
+        hostPort: inst.port,
+        gatewayToken: token,
+        homeDir: inst.homeDir,
+        volumes,
+        llmApiKey: this.deps.config.llmApiKey,
+      }
+      const containerId = await this.deps.runtime.create(spec)
+      await this.deps.runtime.startById(containerId)
+      // 步骤 6：记回新容器 id + 目标镜像 + running + attempts 清零。
+      await this.prisma.container.update({
+        where: { id: inst.id },
+        data: { containerId, image: target, status: 'running', upgradeAttempts: 0 },
+      })
+    } catch (e) {
+      await this.failUpgradeAttempt(inst, 'recreate with target image', e)
+    }
+  }
+
+  // 干净中止（步骤 1/3 失败，spec §2.4）：基础设施抖动 ≠ 升级失败——attempts 不动、不计失败。
+  // 尽力复启旧容器回可用态 + 标 stopped（读侧按 runtime 实况推导 running/stopped，复启成功即显示
+  // running；拉镜像失败于停机前，startById 对 running 容器幂等 no-op）。
+  private async abortClean(inst: Container, what: string, exc: unknown): Promise<void> {
+    // eslint-disable-next-line no-console
+    console.warn(`[fleet] upgrade clean abort (${what}) for ${inst.name}: ${(exc as Error)?.message ?? exc}`)
+    await this.tryRestartOld(inst)
+    await this.prisma.container.update({ where: { id: inst.id }, data: { status: 'stopped' } }).catch(() => {})
+  }
+
+  // 可重试失败（步骤 4/5，spec §2.4）：attempts+1；尽力复启旧容器（store 可能已部分迁移、7.1 可能
+  // 起不来——日志如实记录，不掩盖失败判定）；attempts ≥ UPGRADE_MAX_ATTEMPTS → upgrade_failed 终态。
+  private async failUpgradeAttempt(inst: Container, what: string, exc: unknown): Promise<void> {
+    // eslint-disable-next-line no-console
+    console.warn(`[fleet] upgrade attempt failed (${what}) for ${inst.name}: ${(exc as Error)?.message ?? exc}`)
+    await this.tryRestartOld(inst)
+    const attempts = inst.upgradeAttempts + 1
+    const status: Container['status'] = attempts >= UPGRADE_MAX_ATTEMPTS ? 'upgrade_failed' : 'stopped'
+    await this.prisma.container
+      .update({ where: { id: inst.id }, data: { status, upgradeAttempts: attempts } })
+      .catch(() => {})
+  }
+
+  // 尽力复启旧容器（失败恢复可用态）：containerId 指向旧镜像容器。remove 已删容器 → startById 幂等
+  // no-op；store 已迁移旧镜像起不来 → 抛错捕获记日志（恢复失败不掩盖主失败判定）。
+  private async tryRestartOld(inst: Container): Promise<void> {
+    if (!inst.containerId) return
+    try {
+      await this.deps.runtime.startById(inst.containerId)
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.warn(`[fleet] restart old container after upgrade failure failed for ${inst.name}: ${(e as Error)?.message}`)
+    }
   }
 
   // 惰性构造 renderer：模板 JSON 仅供 create 使用，list/delete 不应因其损坏而失败。

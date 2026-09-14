@@ -54,6 +54,13 @@ export class Orchestrator {
   delete(name: string, expectedId?: string): Promise<DeleteOutcome> {
     return this.cmd.delete(name, expectedId)
   }
+  // #699 升级（守卫/幂等/置 upgrading 同步段 + 后台六步编排异步段；对齐 delete 先例）
+  upgradeReserve(name: string): Promise<{ inst: Container; triggered: boolean }> {
+    return this.cmd.upgradeReserve(name)
+  }
+  submitUpgrade(name: string): Promise<void> {
+    return this.cmd.submitUpgrade(name)
+  }
 
   // 读侧
   list(where: { ownerId?: string } = {}): Promise<ContainerSummary[]> {
