@@ -56,6 +56,7 @@ CREATE TABLE "containers" (
     "containerId" TEXT NOT NULL DEFAULT '',
     "status" TEXT NOT NULL DEFAULT 'creating',
     "image" TEXT NOT NULL,
+    "upgradeAttempts" INTEGER NOT NULL DEFAULT 0,
     "leaseExpiresAt" DATETIME,
     "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" DATETIME NOT NULL,

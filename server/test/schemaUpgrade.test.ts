@@ -14,7 +14,7 @@ function runUpgrade(dbPath: string): void {
 }
 
 // 从「只有 base 表」的旧库跑全量增量脚本（幂等跑两遍）→ 三批表全到位 + T02 幂等列/索引
-// + T03 生命周期时间戳列 + T06 产物三列 + user_version 归 6。
+// + T03 生命周期时间戳列 + T06 产物三列 + #699 upgradeAttempts 列 + user_version 归 7。
 function assertUpgraded(dbPath: string): void {
   const db = new Database(dbPath)
   try {
@@ -57,7 +57,12 @@ function assertUpgraded(dbPath: string): void {
       const c = figureCols.find((x) => x.name === col)!
       expect(c.notnull).toBe(0)
     }
-    expect(db.pragma('user_version', { simple: true })).toBe(6)
+    // #699 升级编排：containers 增量补 upgradeAttempts 列（连续失败计数，成功清零；≥3 终态）。
+    const containerCols = db.prepare('PRAGMA table_info(containers)').all() as Array<{ name: string; dflt_value: string | null; notnull: number }>
+    const attempts = containerCols.find((c) => c.name === 'upgradeAttempts')!
+    expect(attempts.notnull).toBe(1) // NOT NULL
+    expect(attempts.dflt_value).toBe('0') // DEFAULT 0（既有行升级计数从 0 起）
+    expect(db.pragma('user_version', { simple: true })).toBe(7)
   } finally {
     db.close()
   }
@@ -81,6 +86,21 @@ CREATE TABLE "users" (
     "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" DATETIME NOT NULL
 );
+CREATE TABLE "containers" (
+    "id" TEXT NOT NULL PRIMARY KEY,
+    "name" TEXT NOT NULL,
+    "port" INTEGER NOT NULL,
+    "ownerId" TEXT NOT NULL,
+    "token" TEXT NOT NULL,
+    "tokenEncrypted" BOOLEAN NOT NULL DEFAULT false,
+    "homeDir" TEXT NOT NULL,
+    "containerId" TEXT NOT NULL DEFAULT '',
+    "status" TEXT NOT NULL DEFAULT 'creating',
+    "image" TEXT NOT NULL,
+    "leaseExpiresAt" DATETIME,
+    "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" DATETIME NOT NULL
+);
 PRAGMA user_version=1;
 `)
   } finally {
@@ -100,10 +120,11 @@ describe('schema upgrade script', () => {
     assertUpgraded(dbPath)
   })
 
-  it('upgrades an already-text-trace DB (v2) to AutoFigure tables + user_version=6', () => {
+  it('upgrades an already-text-trace DB (v2) to AutoFigure tables + user_version=7', () => {
     const dir = mkdtempSync(path.join(tmpdir(), `schema-upgrade-${process.pid}-`))
     const dbPath = path.join(dir, 'panel.db')
-    // 模拟上一轮增量已交付 text_trace_logs 的既有部署（v2）——增量脚本须只补 figures/generation_jobs。
+    // 模拟上一轮增量已交付 text_trace_logs 的既有部署（v2）——增量脚本须只补 figures/generation_jobs
+    // + containers.upgradeAttempts（#699）。containers 表为 v1 起就有的 base 表，一并种上（缺列）。
     const db = new Database(dbPath)
     try {
       db.exec(`
@@ -121,6 +142,21 @@ CREATE TABLE "text_trace_logs" (
     "outputHash" TEXT NOT NULL DEFAULT '',
     "status" TEXT NOT NULL DEFAULT 'success',
     "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE "containers" (
+    "id" TEXT NOT NULL PRIMARY KEY,
+    "name" TEXT NOT NULL,
+    "port" INTEGER NOT NULL,
+    "ownerId" TEXT NOT NULL,
+    "token" TEXT NOT NULL,
+    "tokenEncrypted" BOOLEAN NOT NULL DEFAULT false,
+    "homeDir" TEXT NOT NULL,
+    "containerId" TEXT NOT NULL DEFAULT '',
+    "status" TEXT NOT NULL DEFAULT 'creating',
+    "image" TEXT NOT NULL,
+    "leaseExpiresAt" DATETIME,
+    "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" DATETIME NOT NULL
 );
 PRAGMA user_version=2;
 `)

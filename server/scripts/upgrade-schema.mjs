@@ -103,10 +103,24 @@ CREATE UNIQUE INDEX IF NOT EXISTS "generation_jobs_figureId_key" ON "generation_
     db.exec(`ALTER TABLE "figures" ADD COLUMN "evaluation" TEXT`)
   }
 
-  db.pragma('user_version = 6')
+  // #699 容器升级编排（spec §2.2）：containers 增加 upgradeAttempts 列（连续失败计数，成功清零；
+  // ≥3 → upgrade_failed 终态）。ADD COLUMN 非幂等，PRAGMA guard 先查再补（对齐 T02/T03/T06 模式）。
+  // fresh 库（init.sql CREATE TABLE 已带列）此处列存在 → guard 跳过；表不存在（异常/极旧部署）→ 跳过
+  // 防 ALTER no such table。
+  const containerTable = db
+    .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='containers'`)
+    .get()
+  if (containerTable) {
+    const containerCols = db.prepare(`PRAGMA table_info("containers")`).all()
+    if (!containerCols.some((c) => c.name === 'upgradeAttempts')) {
+      db.exec(`ALTER TABLE "containers" ADD COLUMN "upgradeAttempts" INTEGER NOT NULL DEFAULT 0`)
+    }
+  }
+
+  db.pragma('user_version = 7')
 } finally {
   db.close()
 }
 
 // eslint-disable-next-line no-console
-console.log(`[db:upgrade] schema upgraded to user_version=6 at ${dbPath}`)
+console.log(`[db:upgrade] schema upgraded to user_version=7 at ${dbPath}`)

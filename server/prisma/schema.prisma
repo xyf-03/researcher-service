@@ -126,6 +126,10 @@ enum ContainerStatus {
   stopped
   removing
   error
+  // #699 容器升级编排（spec §2.2）：upgrading = 六步升级在飞（删/重复触发被拒）；
+  // upgrade_failed = 连续失败进入终态（仅可删除重建）。SQLite TEXT 无 CHECK，纯 app 层 + prisma generate。
+  upgrading
+  upgrade_failed
 }
 
 model Container {
@@ -142,6 +146,8 @@ model Container {
   containerId    String @default("") // run 前未知；空串而非 NULL
   status         ContainerStatus @default(creating)
   image          String
+  // #699 升级编排连续失败计数（spec §2.2）：可重试失败 +1，成功清零；≥3 → upgrade_failed 终态。
+  upgradeAttempts Int @default(0)
   leaseExpiresAt DateTime? // null=无保护
 
   createdAt DateTime @default(now())
